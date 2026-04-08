@@ -1,0 +1,2 @@
+# slack-tooy
+Slack TUI
