@@ -1,0 +1,54 @@
+[package]
+name = "slack-tooy"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal Slack client with vim-style keybindings"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+color-eyre = "0.6"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+reqwest = { version = "0.13", features = ["json", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rusqlite = { version = "0.35", features = ["bundled"] }
+ratatui-image = { version = "10", features = ["crossterm"] }
+libc = "0.2"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
