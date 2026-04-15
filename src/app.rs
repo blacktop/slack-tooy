@@ -78,6 +78,9 @@ pub struct App {
     /// Messages at or before the cutoff are considered read; messages
     /// after are genuinely new and should trigger unread.
     mark_all_read_cutoffs: HashMap<String, String>,
+    /// Deferred unread removal: keeps the current channel visible in
+    /// the unread list until the user navigates away.
+    deferred_read_channel: Option<String>,
 
     pub status_message: Option<String>,
     pub loading: bool,
@@ -121,6 +124,7 @@ impl App {
             pending_thread: None,
             closing_thread: false,
             mark_all_read_cutoffs: HashMap::new(),
+            deferred_read_channel: None,
             status_message: Some("Loading channels...".into()),
             loading: true,
             load_reason: LoadReason::ChannelOpen,
@@ -234,6 +238,11 @@ impl App {
             Action::MarkAllRead => self.handle_mark_all_read(),
             Action::ToggleUnreadFilter => {
                 self.sidebar.filter_unread = !self.sidebar.filter_unread;
+                if self.sidebar.filter_unread {
+                    self.sidebar.snap_selection_to_visible();
+                } else {
+                    self.flush_deferred_read();
+                }
             }
             Action::OpenThread(ref thread_ts) => {
                 self.handle_open_thread(thread_ts);
@@ -311,6 +320,12 @@ impl App {
         }
     }
 
+    fn flush_deferred_read(&mut self) {
+        if let Some(ch) = self.deferred_read_channel.take() {
+            self.sidebar.unread_channels.remove(&ch);
+        }
+    }
+
     fn handle_open_channel(&mut self) {
         let Some(channel) = self.sidebar.selected_channel() else {
             return;
@@ -323,6 +338,7 @@ impl App {
         // is loading should not drop into thread mode later.
         self.pending_thread = None;
         if self.current_channel_id.as_deref() != Some(&channel_id) {
+            self.flush_deferred_read();
             self.current_channel_id = Some(channel_id.clone());
             self.closing_thread = false;
             // Show the new channel name with an empty message list
@@ -337,6 +353,7 @@ impl App {
 
     fn handle_mark_all_read(&mut self) {
         self.sidebar.mark_all_read();
+        self.deferred_read_channel = None;
         // Persist for channels with known timestamps.
         for (ch_id, ts) in &self.latest_ts {
             self.last_seen_ts.insert(ch_id.clone(), ts.clone());
@@ -566,10 +583,14 @@ impl App {
             let already_seen = self.last_seen_ts.get(channel_id).is_some_and(|s| s == &ts);
             if !already_seen {
                 self.last_seen_ts.insert(channel_id.to_string(), ts.clone());
-                self.sidebar.unread_channels.remove(channel_id);
                 if let Err(e) = self.store.mark_read(channel_id, &ts) {
                     tracing::warn!("Failed to persist read state: {e}");
                 }
+            }
+            if self.sidebar.filter_unread {
+                self.deferred_read_channel = Some(channel_id.to_string());
+            } else {
+                self.sidebar.unread_channels.remove(channel_id);
             }
         }
 
@@ -943,26 +964,7 @@ mod tests {
     #[tokio::test]
     async fn channels_loaded_populates_sidebar() {
         let mut app = test_app();
-        let channels = vec![
-            Channel {
-                id: "C1".into(),
-                name: Some("general".into()),
-                is_channel: Some(true),
-                is_im: Some(false),
-                is_member: Some(true),
-                user: String::new(),
-            },
-            Channel {
-                id: "C2".into(),
-                name: Some("random".into()),
-                is_channel: Some(true),
-                is_im: Some(false),
-                is_member: Some(true),
-                user: String::new(),
-            },
-        ];
-
-        app.update(Action::ChannelsLoaded(channels));
+        app.update(Action::ChannelsLoaded(two_channels()));
 
         assert_eq!(app.sidebar.channels.len(), 2);
         assert!(app.status_message.is_none());
@@ -974,14 +976,7 @@ mod tests {
     #[tokio::test]
     async fn select_channel_sets_state() {
         let mut app = test_app();
-        app.sidebar.set_channels(vec![Channel {
-            id: "C1".into(),
-            name: Some("general".into()),
-            is_channel: Some(true),
-            is_im: Some(false),
-            is_member: Some(true),
-            user: String::new(),
-        }]);
+        app.sidebar.set_channels(two_channels());
 
         app.update(Action::OpenChannel);
         assert_eq!(app.current_channel_id.as_deref(), Some("C1"));
@@ -995,20 +990,9 @@ mod tests {
         app.current_channel_id = Some("C1".into());
         app.messages.channel_name = "general".into();
 
-        let messages = vec![SlackMessage {
-            ts: "1234567890.000000".into(),
-            user: "U1".into(),
-            text: "hello".into(),
-            thread_ts: None,
-            reply_count: None,
-            reactions: Vec::new(),
-            bot_id: String::new(),
-            username: String::new(),
-        }];
-
         app.update(Action::MessagesLoaded {
             channel_id: "C1".into(),
-            messages,
+            messages: vec![msg("1234567890.000000")],
             is_background: false,
         });
 
@@ -1023,16 +1007,7 @@ mod tests {
 
         app.update(Action::MessagesLoaded {
             channel_id: "C_OTHER".into(),
-            messages: vec![SlackMessage {
-                ts: "1.0".into(),
-                user: "U".into(),
-                text: "nope".into(),
-                thread_ts: None,
-                reply_count: None,
-                reactions: Vec::new(),
-                bot_id: String::new(),
-                username: String::new(),
-            }],
+            messages: vec![msg("1.0")],
             is_background: false,
         });
 
@@ -1061,6 +1036,107 @@ mod tests {
 
         assert_eq!(app.status_message.as_deref(), Some("oops"));
         assert!(!app.loading);
+    }
+
+    fn two_channels() -> Vec<Channel> {
+        vec![
+            Channel {
+                id: "C1".into(),
+                name: Some("general".into()),
+                is_channel: Some(true),
+                is_im: Some(false),
+                is_member: Some(true),
+                user: String::new(),
+            },
+            Channel {
+                id: "C2".into(),
+                name: Some("random".into()),
+                is_channel: Some(true),
+                is_im: Some(false),
+                is_member: Some(true),
+                user: String::new(),
+            },
+        ]
+    }
+
+    fn msg(ts: &str) -> SlackMessage {
+        SlackMessage {
+            ts: ts.into(),
+            user: "U1".into(),
+            text: "hello".into(),
+            thread_ts: None,
+            reply_count: None,
+            reactions: Vec::new(),
+            bot_id: String::new(),
+            username: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unread_filter_defers_removal_until_navigate_away() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        app.sidebar.unread_channels.insert("C1".into());
+        app.sidebar.unread_channels.insert("C2".into());
+        app.sidebar.filter_unread = true;
+
+        // Simulate opening C1 (set state as handle_open_channel would)
+        app.sidebar.selected = 0;
+        app.current_channel_id = Some("C1".into());
+        app.messages.channel_name = "general".into();
+        app.loading = true;
+        app.load_reason = LoadReason::ChannelOpen;
+
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("100.0")],
+            is_background: false,
+        });
+
+        // C1 should still be visible (deferred) while viewing it
+        assert!(app.sidebar.unread_channels.contains("C1"));
+        assert_eq!(app.deferred_read_channel.as_deref(), Some("C1"));
+
+        // Navigate to C2
+        app.sidebar.selected = 1;
+        app.update(Action::OpenChannel);
+
+        // C1 should now be flushed
+        assert!(!app.sidebar.unread_channels.contains("C1"));
+        // C2 still unread
+        assert!(app.sidebar.unread_channels.contains("C2"));
+    }
+
+    #[test]
+    fn toggle_unread_filter_off_flushes_deferred() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        app.sidebar.unread_channels.insert("C1".into());
+        app.sidebar.filter_unread = true;
+        app.current_channel_id = Some("C1".into());
+        app.deferred_read_channel = Some("C1".into());
+
+        // Toggle filter OFF
+        app.update(Action::ToggleUnreadFilter);
+
+        assert!(!app.sidebar.filter_unread);
+        assert!(!app.sidebar.unread_channels.contains("C1"));
+        assert!(app.deferred_read_channel.is_none());
+    }
+
+    #[test]
+    fn toggle_unread_filter_on_snaps_selection() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        // Only C2 (index 1) is unread; selection is on C1 (index 0)
+        app.sidebar.unread_channels.insert("C2".into());
+        app.sidebar.selected = 0;
+
+        app.update(Action::ToggleUnreadFilter);
+
+        assert!(app.sidebar.filter_unread);
+        // Selection should snap to C2 (the only unread channel)
+        assert_eq!(app.sidebar.selected, 1);
     }
 
     #[test]

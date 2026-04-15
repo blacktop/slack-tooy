@@ -75,15 +75,19 @@ impl ChannelSidebar {
         self.unread_channels.clear();
     }
 
+    pub fn snap_selection_to_visible(&mut self) {
+        let visible = self.visible_indices();
+        if !visible.is_empty() && !visible.contains(&self.selected) {
+            self.selected = visible[0];
+        }
+    }
+
     /// Indices into `self.channels` that pass the current filter.
-    /// The currently selected channel is always included.
     fn visible_indices(&self) -> Vec<usize> {
         self.channels
             .iter()
             .enumerate()
-            .filter(|(i, ch)| {
-                !self.filter_unread || self.unread_channels.contains(&ch.id) || *i == self.selected
-            })
+            .filter(|(_, ch)| !self.filter_unread || self.unread_channels.contains(&ch.id))
             .map(|(i, _)| i)
             .collect()
     }
