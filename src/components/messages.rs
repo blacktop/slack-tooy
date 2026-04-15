@@ -206,6 +206,21 @@ impl MessageList {
                 }
             }
 
+            for file in &msg.files {
+                let size = format_file_size(file.size);
+                let label = if file.name.is_empty() {
+                    format!("[file] ({size})")
+                } else {
+                    format!("[file] {} ({size})", file.name)
+                };
+                for wrapped in wrap_text(&label, text_width) {
+                    lines.push(VisualLine::text(
+                        Line::from(Span::from(wrapped).fg(Color::Rgb(130, 170, 210))),
+                        i,
+                    ));
+                }
+            }
+
             if !msg.reactions.is_empty() {
                 for line in format_reactions(&msg.reactions, &self.custom_emoji_urls, text_width) {
                     lines.push(VisualLine::text(line, i));
@@ -568,6 +583,19 @@ fn split_to_width(text: &str, width: usize) -> (&str, &str, usize) {
     (text, "", used_width)
 }
 
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    #[expect(clippy::cast_precision_loss, reason = "display-only rounding")]
+    match bytes {
+        0..KB => format!("{bytes} B"),
+        KB..MB => format!("{:.1} KB", bytes as f64 / KB as f64),
+        MB..GB => format!("{:.1} MB", bytes as f64 / MB as f64),
+        _ => format!("{:.1} GB", bytes as f64 / GB as f64),
+    }
+}
+
 /// Convert Slack timestamp "1234567890.123456" to "HH:MM" in local time.
 fn format_slack_ts(ts: &str) -> String {
     ts.split('.')
@@ -703,5 +731,17 @@ mod tests {
             wrapped,
             vec!["a".to_string(), "   ".to_string(), " b".to_string()]
         );
+    }
+
+    #[test]
+    fn file_size_formatting() {
+        use super::format_file_size;
+
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(512), "512 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1_048_576), "1.0 MB");
+        assert_eq!(format_file_size(2_621_440), "2.5 MB");
+        assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
     }
 }

@@ -32,11 +32,24 @@ pub struct SlackMessage {
     pub reply_count: Option<u32>,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub files: Vec<SlackFile>,
     /// Bot messages omit `user` and provide these instead.
     #[serde(default)]
     pub bot_id: String,
     #[serde(default)]
     pub username: String,
+}
+
+/// File attached to a Slack message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlackFile {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub mimetype: String,
 }
 
 impl SlackMessage {
@@ -217,6 +230,37 @@ mod tests {
         assert_eq!(resp.data.messages.len(), 2);
         assert_eq!(resp.data.messages[0].text, "Hello, world!");
         assert_eq!(resp.data.messages[1].reply_count, Some(3));
+    }
+
+    #[test]
+    fn decode_file_share_message() {
+        let json = r#"{
+            "ok": true,
+            "messages": [
+                {
+                    "ts": "1712500100.000300",
+                    "user": "U1",
+                    "text": "",
+                    "files": [
+                        {
+                            "id": "F123",
+                            "name": "report.pdf",
+                            "size": 2621440,
+                            "mimetype": "application/pdf"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let resp: SlackApiResponse<ConversationsHistoryData> =
+            serde_json::from_str(json).expect("decode");
+        assert_eq!(resp.data.messages.len(), 1);
+        let msg = &resp.data.messages[0];
+        assert!(msg.text.is_empty());
+        assert_eq!(msg.files.len(), 1);
+        assert_eq!(msg.files[0].name, "report.pdf");
+        assert_eq!(msg.files[0].size, 2_621_440);
+        assert_eq!(msg.files[0].mimetype, "application/pdf");
     }
 
     #[test]

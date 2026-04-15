@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use color_eyre::eyre::{Result, bail};
 use reqwest::Client;
 
@@ -23,8 +25,14 @@ impl SlackClient {
         } else {
             Some(cookie.to_string())
         };
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             token: token.to_string(),
             cookie,
         }

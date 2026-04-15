@@ -1067,6 +1067,7 @@ mod tests {
             thread_ts: None,
             reply_count: None,
             reactions: Vec::new(),
+            files: Vec::new(),
             bot_id: String::new(),
             username: String::new(),
         }
