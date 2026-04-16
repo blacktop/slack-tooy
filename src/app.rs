@@ -141,6 +141,7 @@ impl App {
 
         self.validate_auth();
         self.load_channels();
+        self.load_stars();
         self.load_custom_emoji();
 
         loop {
@@ -220,21 +221,11 @@ impl App {
     pub fn update(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
-            Action::EnterNormalMode => {
-                self.mode = Mode::Normal;
-            }
-            Action::EnterInsertMode => {
-                self.mode = Mode::Insert;
-            }
-            Action::FocusSidebar => {
-                self.focus = Focus::Sidebar;
-            }
-            Action::FocusMessages => {
-                self.focus = Focus::Messages;
-            }
-            Action::OpenChannel => {
-                self.handle_open_channel();
-            }
+            Action::EnterNormalMode => self.mode = Mode::Normal,
+            Action::EnterInsertMode => self.mode = Mode::Insert,
+            Action::FocusSidebar => self.focus = Focus::Sidebar,
+            Action::FocusMessages => self.focus = Focus::Messages,
+            Action::OpenChannel => self.handle_open_channel(),
             Action::MarkAllRead => self.handle_mark_all_read(),
             Action::ToggleUnreadFilter => {
                 self.sidebar.filter_unread = !self.sidebar.filter_unread;
@@ -296,6 +287,9 @@ impl App {
                 image_data,
             } => {
                 self.handle_avatar_downloaded(&user_id, &image_data);
+            }
+            Action::StarsLoaded(starred) => {
+                self.sidebar.set_starred(starred);
             }
             Action::CustomEmojiLoaded(emoji_map) => {
                 self.handle_custom_emoji_loaded(&emoji_map);
@@ -651,12 +645,13 @@ impl App {
         }
         self.last_poll = Instant::now();
 
-        // Poll current view (thread or channel)
+        // Refresh current view (errors suppressed — user already has
+        // the messages and a transient failure shouldn't disrupt reading).
         if let Some(ref channel_id) = self.current_channel_id {
             if let Some(ref thread_ts) = self.messages.active_thread {
-                self.load_thread_replies(channel_id, thread_ts);
+                self.load_thread_replies_quiet(channel_id, thread_ts);
             } else {
-                self.load_messages(channel_id);
+                self.load_messages_refresh(channel_id);
             }
         }
 
@@ -743,19 +738,39 @@ impl App {
         });
     }
 
+    fn load_stars(&self) {
+        let tx = self.action_tx.clone();
+        let client = self.slack.clone();
+        tokio::spawn(async move {
+            match client.list_stars().await {
+                Ok(starred) => {
+                    let _ = tx.send(Action::StarsLoaded(starred));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load stars: {e}");
+                }
+            }
+        });
+    }
+
     fn load_messages(&self, channel_id: &str) {
-        self.spawn_fetch_messages(channel_id, 50, false);
+        self.spawn_fetch_messages(channel_id, 50, false, false);
+    }
+
+    /// Foreground refresh: updates the message list but swallows errors
+    /// so transient poll failures don't flash in the status bar.
+    fn load_messages_refresh(&self, channel_id: &str) {
+        self.spawn_fetch_messages(channel_id, 50, false, true);
     }
 
     fn load_messages_background(&self, channel_id: &str) {
-        self.spawn_fetch_messages(channel_id, 1, true);
+        self.spawn_fetch_messages(channel_id, 1, true, true);
     }
 
-    fn spawn_fetch_messages(&self, channel_id: &str, limit: u32, silent: bool) {
+    fn spawn_fetch_messages(&self, channel_id: &str, limit: u32, is_background: bool, quiet: bool) {
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
         let channel_id = channel_id.to_string();
-        let is_background = silent;
         tokio::spawn(async move {
             match client.fetch_history(&channel_id, limit).await {
                 Ok(messages) => {
@@ -765,8 +780,8 @@ impl App {
                         is_background,
                     });
                 }
-                Err(e) if silent => {
-                    tracing::debug!("Background poll failed for {channel_id}: {e}");
+                Err(e) if quiet => {
+                    tracing::debug!("Poll failed for {channel_id}: {e}");
                 }
                 Err(e) => {
                     let _ = tx.send(Action::Error(format!("Failed to load messages: {e}")));
@@ -797,6 +812,14 @@ impl App {
     }
 
     fn load_thread_replies(&self, channel_id: &str, thread_ts: &str) {
+        self.spawn_fetch_thread(channel_id, thread_ts, false);
+    }
+
+    fn load_thread_replies_quiet(&self, channel_id: &str, thread_ts: &str) {
+        self.spawn_fetch_thread(channel_id, thread_ts, true);
+    }
+
+    fn spawn_fetch_thread(&self, channel_id: &str, thread_ts: &str, quiet: bool) {
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
         let channel_id = channel_id.to_string();
@@ -809,6 +832,9 @@ impl App {
                         thread_ts,
                         messages,
                     });
+                }
+                Err(e) if quiet => {
+                    tracing::debug!("Thread poll failed for {channel_id}: {e}");
                 }
                 Err(e) => {
                     let _ = tx.send(Action::Error(format!("Failed to load thread: {e}")));

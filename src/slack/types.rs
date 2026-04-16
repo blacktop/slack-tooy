@@ -147,6 +147,20 @@ pub struct UserInfoData {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StarsListData {
+    #[serde(default)]
+    pub items: Vec<StarItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StarItem {
+    #[serde(rename = "type")]
+    pub item_type: String,
+    #[serde(default)]
+    pub channel: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmojiListData {
     #[serde(default)]
     pub emoji: std::collections::HashMap<String, String>,

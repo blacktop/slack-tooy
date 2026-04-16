@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, bail};
@@ -5,7 +6,7 @@ use reqwest::Client;
 
 use crate::slack::types::{
     AuthInfo, Channel, ConversationsHistoryData, ConversationsListData, EmojiListData,
-    PostMessageData, SlackApiResponse, SlackMessage, User, UserInfoData,
+    PostMessageData, SlackApiResponse, SlackMessage, StarsListData, User, UserInfoData,
 };
 
 const SLACK_API_BASE: &str = "https://slack.com/api";
@@ -60,8 +61,16 @@ impl SlackClient {
         params: &[(&str, &str)],
     ) -> Result<T> {
         let url = format!("{SLACK_API_BASE}/{method}");
+        // Retry once on transport errors (stale pooled connections).
         let builder = self.client.get(&url).query(params);
-        let resp = self.apply_auth(builder).send().await?;
+        let resp = match self.apply_auth(builder).send().await {
+            Ok(resp) => resp,
+            Err(first_err) => {
+                tracing::debug!("Retrying GET {method}: {first_err}");
+                let builder = self.client.get(&url).query(params);
+                self.apply_auth(builder).send().await?
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -106,6 +115,19 @@ impl SlackClient {
     pub async fn list_emoji(&self) -> Result<std::collections::HashMap<String, String>> {
         let data: EmojiListData = self.get("emoji.list", &[]).await?;
         Ok(data.emoji)
+    }
+
+    pub async fn list_stars(&self) -> Result<HashSet<String>> {
+        let params = vec![("limit", "200")];
+        let data: StarsListData = self.get("stars.list", &params).await?;
+        let starred = data
+            .items
+            .into_iter()
+            .filter(|item| matches!(item.item_type.as_str(), "channel" | "im" | "group" | "mpim"))
+            .map(|item| item.channel)
+            .filter(|id| !id.is_empty())
+            .collect();
+        Ok(starred)
     }
 
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {

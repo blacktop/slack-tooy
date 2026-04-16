@@ -20,7 +20,9 @@ const SIDEBAR_RIGHT_PAD: usize = 1;
 pub struct ChannelSidebar {
     pub channels: Vec<Channel>,
     pub unread_channels: HashSet<String>,
+    pub starred_channels: HashSet<String>,
     pub filter_unread: bool,
+    collapsed_sections: HashSet<Section>,
     /// DM channel display names keyed by user ID.
     dm_names: HashMap<String, String>,
     /// Index into `channels` (not filtered).
@@ -33,7 +35,9 @@ impl ChannelSidebar {
         Self {
             channels: Vec::new(),
             unread_channels: HashSet::new(),
+            starred_channels: HashSet::new(),
             filter_unread: false,
+            collapsed_sections: HashSet::new(),
             dm_names: HashMap::new(),
             selected: 0,
             scroll_offset: 0,
@@ -41,14 +45,51 @@ impl ChannelSidebar {
     }
 
     pub fn set_channels(&mut self, mut channels: Vec<Channel>) {
+        let starred = &self.starred_channels;
         channels.sort_by(|a, b| {
-            let a_dm = a.is_im.unwrap_or(false);
-            let b_dm = b.is_im.unwrap_or(false);
-            a_dm.cmp(&b_dm)
+            (channel_section(starred, a) as u8)
+                .cmp(&(channel_section(starred, b) as u8))
                 .then_with(|| a.display_name().cmp(b.display_name()))
         });
         self.channels = channels;
         self.selected = 0;
+    }
+
+    pub fn set_starred(&mut self, starred: HashSet<String>) {
+        self.starred_channels = starred;
+        self.resort();
+    }
+
+    fn resort(&mut self) {
+        let selected_id = self.selected_channel().map(|ch| ch.id.clone());
+        let starred = &self.starred_channels;
+        self.channels.sort_by(|a, b| {
+            (channel_section(starred, a) as u8)
+                .cmp(&(channel_section(starred, b) as u8))
+                .then_with(|| a.display_name().cmp(b.display_name()))
+        });
+        if let Some(ref id) = selected_id
+            && let Some(idx) = self.channels.iter().position(|c| c.id == *id)
+        {
+            self.selected = idx;
+        }
+    }
+
+    fn toggle_current_section(&mut self) {
+        let Some(ch) = self.selected_channel() else {
+            return;
+        };
+        let section = channel_section(&self.starred_channels, ch);
+        if self.collapsed_sections.contains(&section) {
+            self.collapsed_sections.remove(&section);
+        } else {
+            self.collapsed_sections.insert(section);
+            self.snap_selection_to_visible();
+        }
+    }
+
+    fn expand_all_sections(&mut self) {
+        self.collapsed_sections.clear();
     }
 
     pub fn selected_channel(&self) -> Option<&Channel> {
@@ -87,7 +128,13 @@ impl ChannelSidebar {
         self.channels
             .iter()
             .enumerate()
-            .filter(|(_, ch)| !self.filter_unread || self.unread_channels.contains(&ch.id))
+            .filter(|(_, ch)| {
+                if self.filter_unread && !self.unread_channels.contains(&ch.id) {
+                    return false;
+                }
+                let section = channel_section(&self.starred_channels, ch);
+                !self.collapsed_sections.contains(&section)
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -124,6 +171,27 @@ impl ChannelSidebar {
         }
     }
 
+    /// Does this section have any channels (regardless of filters)?
+    fn section_exists(&self, section: Section) -> bool {
+        self.channels
+            .iter()
+            .any(|ch| channel_section(&self.starred_channels, ch) == section)
+    }
+
+    /// Should a section header be shown?  Yes if the section has
+    /// channels and either is collapsed or has visible items.
+    fn show_section_header(&self, section: Section, visible: &[usize]) -> bool {
+        if !self.section_exists(section) {
+            return false;
+        }
+        if self.collapsed_sections.contains(&section) {
+            return true;
+        }
+        visible
+            .iter()
+            .any(|&i| channel_section(&self.starred_channels, &self.channels[i]) == section)
+    }
+
     fn ensure_visible(&mut self, visible: &[usize], visible_height: usize) {
         if visible_height == 0 {
             return;
@@ -137,20 +205,21 @@ impl ChannelSidebar {
     }
 
     fn visual_row_for_selected(&self, visible: &[usize]) -> usize {
-        let dm_start = visible
-            .iter()
-            .position(|&i| self.channels[i].is_im.unwrap_or(false));
-
         let mut row = 0;
-        for (vi, &ci) in visible.iter().enumerate() {
-            // "Direct Messages" section header adds a row.
-            if Some(vi) == dm_start {
+        for &(section, _) in &SECTIONS {
+            if !self.show_section_header(section, visible) {
+                continue;
+            }
+            row += 1; // section header
+            for &ci in visible {
+                if channel_section(&self.starred_channels, &self.channels[ci]) != section {
+                    continue;
+                }
+                if ci == self.selected {
+                    return row;
+                }
                 row += 1;
             }
-            if ci == self.selected {
-                return row;
-            }
-            row += 1;
         }
         row
     }
@@ -173,6 +242,14 @@ impl Component for ChannelSidebar {
             }
             KeyCode::Char('G') => {
                 self.select_last();
+                EventResult::Consumed
+            }
+            KeyCode::Char('z') => {
+                self.toggle_current_section();
+                EventResult::Consumed
+            }
+            KeyCode::Char('Z') => {
+                self.expand_all_sections();
                 EventResult::Consumed
             }
             KeyCode::Enter => EventResult::Action(Action::OpenChannel),
@@ -206,60 +283,61 @@ impl Component for ChannelSidebar {
         let visible_height = inner.height as usize;
         self.ensure_visible(&visible, visible_height);
 
-        let dm_start = visible
-            .iter()
-            .position(|&i| self.channels[i].is_im.unwrap_or(false));
-
         let mut lines: Vec<Line> = Vec::new();
 
         // Available columns for channel text (inside border, minus
         // right padding).
         let max_text_width = (inner.width as usize).saturating_sub(SIDEBAR_RIGHT_PAD);
 
-        for (vi, &ci) in visible.iter().enumerate() {
-            if Some(vi) == dm_start {
-                lines.push(Line::from(Span::from(" Direct Messages").bold().dim()));
+        for &(section, label) in &SECTIONS {
+            if !self.show_section_header(section, &visible) {
+                continue;
             }
+            let collapsed = self.collapsed_sections.contains(&section);
+            let chevron = if collapsed { "▸" } else { "▾" };
+            lines.push(Line::from(format!(" {chevron} {label}")).bold().dim());
 
-            let ch = &self.channels[ci];
-            let is_dm = ch.is_im.unwrap_or(false);
-            let prefix = if is_dm { "  " } else { " # " };
-            let label = self.channel_label(ch);
-            let selected = ci == self.selected;
-            let has_unread = self.unread_channels.contains(&ch.id);
+            for &ci in &visible {
+                if channel_section(&self.starred_channels, &self.channels[ci]) != section {
+                    continue;
+                }
+                let ch = &self.channels[ci];
+                let is_dm = ch.is_im.unwrap_or(false);
+                let prefix = if is_dm { "  " } else { " # " };
+                let channel_label = self.channel_label(ch);
+                let selected = ci == self.selected;
+                let has_unread = self.unread_channels.contains(&ch.id);
 
-            // Gutter: ">" for selected, " " otherwise — 1 column.
-            let gutter_width = 1;
-            // Unread indicator " *" takes 2 columns — but the
-            // selected branch never emits it, so don't charge it.
-            let suffix_width = if has_unread && !selected { 2 } else { 0 };
-            let prefix_width = UnicodeWidthStr::width(prefix);
-            let label_budget =
-                max_text_width.saturating_sub(gutter_width + prefix_width + suffix_width);
-            let display_label = truncate_with_ellipsis(&label, label_budget);
-            let text = format!("{prefix}{display_label}");
+                let gutter_width = 1;
+                let suffix_width = if has_unread && !selected { 2 } else { 0 };
+                let prefix_width = UnicodeWidthStr::width(prefix);
+                let label_budget =
+                    max_text_width.saturating_sub(gutter_width + prefix_width + suffix_width);
+                let display_label = truncate_with_ellipsis(&channel_label, label_budget);
+                let text = format!("{prefix}{display_label}");
 
-            let line = if selected {
-                Line::from(vec![
-                    Span::from(">").bold().cyan(),
-                    Span::from(text).bold().cyan(),
-                ])
-            } else if has_unread {
-                Line::from(vec![
-                    Span::from(" "),
-                    Span::from(text).bold().yellow(),
-                    Span::from(" *").bold().yellow(),
-                ])
-            } else if is_dm {
-                Line::from(vec![
-                    Span::from(" "),
-                    Span::from(text).fg(Color::Rgb(160, 165, 200)),
-                ])
-            } else {
-                Line::from(vec![Span::from(" "), Span::from(text)])
-            };
+                let line = if selected {
+                    Line::from(vec![
+                        Span::from(">").bold().cyan(),
+                        Span::from(text).bold().cyan(),
+                    ])
+                } else if has_unread {
+                    Line::from(vec![
+                        Span::from(" "),
+                        Span::from(text).bold().yellow(),
+                        Span::from(" *").bold().yellow(),
+                    ])
+                } else if is_dm {
+                    Line::from(vec![
+                        Span::from(" "),
+                        Span::from(text).fg(Color::Rgb(160, 165, 200)),
+                    ])
+                } else {
+                    Line::from(vec![Span::from(" "), Span::from(text)])
+                };
 
-            lines.push(line);
+                lines.push(line);
+            }
         }
 
         if lines.is_empty() && self.filter_unread {
@@ -278,6 +356,29 @@ impl Component for ChannelSidebar {
             let scrollbar = Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight);
             frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Section {
+    Starred = 0,
+    Channels = 1,
+    DirectMessages = 2,
+}
+
+const SECTIONS: [(Section, &str); 3] = [
+    (Section::Starred, "⭐ Starred"),
+    (Section::Channels, "# Channels"),
+    (Section::DirectMessages, "💬 Direct Messages"),
+];
+
+fn channel_section(starred: &HashSet<String>, ch: &Channel) -> Section {
+    if starred.contains(&ch.id) {
+        Section::Starred
+    } else if ch.is_im.unwrap_or(false) {
+        Section::DirectMessages
+    } else {
+        Section::Channels
     }
 }
 

@@ -58,6 +58,7 @@ pub enum Action {
         user_id: String,
         image_data: Vec<u8>,
     },
+    StarsLoaded(std::collections::HashSet<String>),
     CustomEmojiLoaded(std::collections::HashMap<String, String>),
     AuthValidated {
         user_name: String,
