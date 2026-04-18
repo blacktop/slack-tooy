@@ -16,7 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::action::Action;
 use crate::components::{Component, EventResult};
 use crate::emoji;
-use crate::slack::types::{Reaction, SlackMessage};
+use crate::slack::types::{Reaction, SlackMessage, replace_user_mentions};
 
 const AVATAR_WIDTH: u16 = 4;
 /// Right-side padding inside the messages panel (matches the 1-column
@@ -201,7 +201,10 @@ impl MessageList {
             prev_user = Some(sender);
 
             if !msg.text.is_empty() {
-                for wrapped in wrap_text(&msg.text, text_width) {
+                let rendered_text = replace_user_mentions(&msg.text, |user_id| {
+                    self.user_cache.get(user_id).cloned()
+                });
+                for wrapped in wrap_text(&rendered_text, text_width) {
                     lines.push(VisualLine::text(Line::from(Span::from(wrapped)), i));
                 }
             }
@@ -708,7 +711,10 @@ fn ensure_selected_visible(
 
 #[cfg(test)]
 mod tests {
-    use crate::components::messages::wrap_text;
+    use std::collections::HashMap;
+
+    use crate::components::messages::{MessageList, wrap_text};
+    use crate::slack::types::SlackMessage;
 
     #[test]
     fn wrap_text_preserves_whitespace_runs_when_wrapping() {
@@ -743,5 +749,30 @@ mod tests {
         assert_eq!(format_file_size(1_048_576), "1.0 MB");
         assert_eq!(format_file_size(2_621_440), "2.5 MB");
         assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
+    }
+
+    #[test]
+    fn build_lines_replaces_user_mentions_with_cached_names() {
+        let mut list = MessageList::new();
+        list.user_cache = HashMap::from([(String::from("U2"), String::from("Alice"))]);
+        list.messages = vec![SlackMessage {
+            ts: "1.0".into(),
+            user: "U1".into(),
+            text: "hello <@U2>".into(),
+            thread_ts: None,
+            reply_count: None,
+            reactions: Vec::new(),
+            files: Vec::new(),
+            bot_id: String::new(),
+            username: String::new(),
+        }];
+
+        let lines = list.build_lines(80);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.line.to_string() == "hello @Alice")
+        );
     }
 }

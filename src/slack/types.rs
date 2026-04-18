@@ -66,6 +66,77 @@ impl SlackMessage {
     }
 }
 
+pub fn mentioned_user_ids(text: &str) -> Vec<&str> {
+    let mut ids = Vec::new();
+    let mut remainder = text;
+
+    while let Some(start) = remainder.find("<@") {
+        let after_start = &remainder[start + 2..];
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        let mention = &after_start[..end];
+        if let Some((user_id, _)) = parse_user_mention(mention) {
+            ids.push(user_id);
+        }
+        remainder = &after_start[end + 1..];
+    }
+
+    ids
+}
+
+pub fn replace_user_mentions(
+    text: &str,
+    mut resolve_name: impl FnMut(&str) -> Option<String>,
+) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    let mut remainder = text;
+
+    while let Some(start) = remainder.find("<@") {
+        rendered.push_str(&remainder[..start]);
+
+        let after_start = &remainder[start + 2..];
+        let Some(end) = after_start.find('>') else {
+            rendered.push_str(&remainder[start..]);
+            return rendered;
+        };
+
+        let mention = &after_start[..end];
+        if let Some((user_id, fallback)) = parse_user_mention(mention) {
+            let display_name = resolve_name(user_id).unwrap_or_else(|| fallback.to_string());
+            rendered.push('@');
+            rendered.push_str(&display_name);
+        } else {
+            rendered.push_str("<@");
+            rendered.push_str(mention);
+            rendered.push('>');
+        }
+
+        remainder = &after_start[end + 1..];
+    }
+
+    rendered.push_str(remainder);
+    rendered
+}
+
+pub fn is_slack_user_id(user_id: &str) -> bool {
+    matches!(user_id.chars().next(), Some('U' | 'W'))
+}
+
+fn parse_user_mention(mention: &str) -> Option<(&str, &str)> {
+    let (user_id, fallback) = mention
+        .split_once('|')
+        .map_or((mention, mention), |(user_id, label)| {
+            (user_id, label.strip_prefix('@').unwrap_or(label))
+        });
+
+    if user_id.is_empty() || !is_slack_user_id(user_id) {
+        return None;
+    }
+
+    Some((user_id, fallback))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Reaction {
     pub name: String,
@@ -364,6 +435,42 @@ mod tests {
             profile: None,
         };
         assert_eq!(name_only.best_name(), "alice");
+    }
+
+    #[test]
+    fn mentioned_user_ids_extract_all_mentions() {
+        let ids = mentioned_user_ids("hi <@U1> and <@U2|alice.smith>");
+
+        assert_eq!(ids, vec!["U1", "U2"]);
+    }
+
+    #[test]
+    fn replace_user_mentions_uses_resolved_names() {
+        let rendered =
+            replace_user_mentions(
+                "hello <@U1> and <@U2|alice.smith>",
+                |user_id| match user_id {
+                    "U1" => Some("Alice".to_string()),
+                    "U2" => Some("Bob".to_string()),
+                    _ => None,
+                },
+            );
+
+        assert_eq!(rendered, "hello @Alice and @Bob");
+    }
+
+    #[test]
+    fn replace_user_mentions_falls_back_to_label_or_user_id() {
+        let rendered = replace_user_mentions("hello <@U1|alice.smith> and <@U2>", |_| None);
+
+        assert_eq!(rendered, "hello @alice.smith and @U2");
+    }
+
+    #[test]
+    fn replace_user_mentions_leaves_non_user_mentions_unchanged() {
+        let rendered = replace_user_mentions("hello <@B1|deploy-bot>", |_| None);
+
+        assert_eq!(rendered, "hello <@B1|deploy-bot>");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use color_eyre::eyre::Result;
@@ -13,7 +13,7 @@ use crate::components::{Component, EventResult};
 use crate::config::Config;
 use crate::event::{AppEvent, EventHandler};
 use crate::slack::client::SlackClient;
-use crate::slack::types::{Channel, SlackMessage};
+use crate::slack::types::{Channel, SlackMessage, is_slack_user_id, mentioned_user_ids};
 use crate::store::Store;
 use crate::tui::Tui;
 use crate::ui;
@@ -615,25 +615,7 @@ impl App {
     }
 
     fn resolve_missing_users(&mut self) {
-        let mut seen = std::collections::HashSet::new();
-        let to_resolve: Vec<String> = self
-            .messages
-            .messages
-            .iter()
-            .filter_map(|m| {
-                let sender = m.sender_id();
-                // Only resolve user IDs (U…), not bot IDs (B…) which
-                // use the users.info endpoint differently.
-                if sender.is_empty()
-                    || !sender.starts_with('U')
-                    || self.messages.user_cache.contains_key(sender)
-                    || !seen.insert(sender.to_string())
-                {
-                    return None;
-                }
-                Some(sender.to_string())
-            })
-            .collect();
+        let to_resolve = unresolved_user_ids(&self.messages.messages, &self.messages.user_cache);
         for user_id in to_resolve {
             self.resolve_user(user_id);
         }
@@ -939,6 +921,41 @@ impl App {
     }
 }
 
+fn unresolved_user_ids(
+    messages: &[SlackMessage],
+    user_cache: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut unresolved = Vec::new();
+
+    for message in messages {
+        push_unresolved_user_id(message.sender_id(), user_cache, &mut seen, &mut unresolved);
+
+        for user_id in mentioned_user_ids(&message.text) {
+            push_unresolved_user_id(user_id, user_cache, &mut seen, &mut unresolved);
+        }
+    }
+
+    unresolved
+}
+
+fn push_unresolved_user_id(
+    user_id: &str,
+    user_cache: &HashMap<String, String>,
+    seen: &mut HashSet<String>,
+    unresolved: &mut Vec<String>,
+) {
+    if user_id.is_empty()
+        || !is_slack_user_id(user_id)
+        || user_cache.contains_key(user_id)
+        || !seen.insert(user_id.to_string())
+    {
+        return;
+    }
+
+    unresolved.push(user_id.to_string());
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
@@ -1181,6 +1198,47 @@ mod tests {
         assert_eq!(
             read_state.get(&channel_id).map(String::as_str),
             Some("10.0")
+        );
+    }
+
+    #[test]
+    fn unresolved_user_ids_include_senders_and_mentions() {
+        let user_cache = HashMap::from([(String::from("U1"), String::from("Alice"))]);
+        let messages = vec![
+            SlackMessage {
+                ts: "1.0".into(),
+                user: "U1".into(),
+                text: "hi <@U2> and <@U3|carol>".into(),
+                thread_ts: None,
+                reply_count: None,
+                reactions: Vec::new(),
+                files: Vec::new(),
+                bot_id: String::new(),
+                username: String::new(),
+            },
+            SlackMessage {
+                ts: "2.0".into(),
+                user: "W2".into(),
+                text: "ping <@W3>".into(),
+                thread_ts: None,
+                reply_count: None,
+                reactions: Vec::new(),
+                files: Vec::new(),
+                bot_id: String::new(),
+                username: String::new(),
+            },
+        ];
+
+        let unresolved = unresolved_user_ids(&messages, &user_cache);
+
+        assert_eq!(
+            unresolved,
+            vec![
+                String::from("U2"),
+                String::from("U3"),
+                String::from("W2"),
+                String::from("W3")
+            ]
         );
     }
 }
