@@ -10,6 +10,7 @@ use crate::action::Action;
 pub enum AppEvent {
     Tick,
     Key(KeyEvent),
+    Paste(String),
     Resize,
     BackgroundAction(Action),
 }
@@ -41,6 +42,9 @@ impl EventHandler {
                         if key.kind == KeyEventKind::Press =>
                     {
                         Ok(AppEvent::Key(key))
+                    }
+                    Event::Paste(text) => {
+                        Ok(AppEvent::Paste(text))
                     }
                     Event::Resize(_, _) => {
                         Ok(AppEvent::Resize)

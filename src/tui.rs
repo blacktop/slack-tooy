@@ -1,7 +1,8 @@
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 
 use color_eyre::eyre::Result;
 use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -22,7 +23,7 @@ impl Tui {
 
     pub fn enter(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
 
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
@@ -44,7 +45,7 @@ impl Tui {
 
     fn reset() -> Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
         Ok(())
     }
 
@@ -53,6 +54,13 @@ impl Tui {
         F: FnOnce(&mut ratatui::Frame),
     {
         self.terminal.draw(f)?;
+        Ok(())
+    }
+
+    pub fn ring_bell(&mut self) -> Result<()> {
+        let backend = self.terminal.backend_mut();
+        backend.write_all(b"\x07")?;
+        backend.flush()?;
         Ok(())
     }
 }

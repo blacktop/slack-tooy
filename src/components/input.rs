@@ -1,11 +1,14 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use crate::action::Action;
 use crate::components::{Component, EventResult};
+
+const PASTE_TAB_WIDTH: usize = 4;
 
 pub struct TextInput {
     text: Vec<char>,
@@ -24,6 +27,37 @@ impl TextInput {
         self.text.iter().collect()
     }
 
+    pub fn insert_text(&mut self, text: &str) {
+        let mut skip_next_linefeed = false;
+        for c in text.chars() {
+            if skip_next_linefeed {
+                skip_next_linefeed = false;
+                if c == '\n' {
+                    continue;
+                }
+            }
+
+            match c {
+                '\r' => {
+                    self.insert_char('\n');
+                    skip_next_linefeed = true;
+                }
+                '\n' => {
+                    self.insert_char('\n');
+                }
+                '\t' => {
+                    for _ in 0..PASTE_TAB_WIDTH {
+                        self.insert_char(' ');
+                    }
+                }
+                c if c.is_control() => {}
+                c => {
+                    self.insert_char(c);
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor_pos = 0;
@@ -33,25 +67,40 @@ impl TextInput {
         self.text.is_empty()
     }
 
-    /// Number of visual lines in the input (1 + count of newlines).
-    pub fn line_count(&self) -> u16 {
-        let count = self.text.iter().filter(|&&c| c == '\n').count();
-        u16::try_from(count + 1).unwrap_or(u16::MAX)
+    /// Number of rendered rows needed for the input at a given inner
+    /// width, including explicit newlines and soft wraps.
+    pub fn visual_line_count(&self, width: u16) -> u16 {
+        let (row, _) = Self::wrapped_row_col(self.text.iter().copied(), width);
+        u16::try_from(row.saturating_add(1)).unwrap_or(u16::MAX)
     }
 
-    /// Cursor (row, col) where row counts newlines before cursor
-    /// and col counts chars since the last newline.
-    fn cursor_row_col(&self) -> (usize, usize) {
-        let mut row = 0;
-        let mut col = 0;
-        for &c in &self.text[..self.cursor_pos] {
+    fn cursor_visual_row_col(&self, width: u16) -> (usize, usize) {
+        Self::wrapped_row_col(self.text[..self.cursor_pos].iter().copied(), width)
+    }
+
+    fn wrapped_row_col<I>(chars: I, width: u16) -> (usize, usize)
+    where
+        I: IntoIterator<Item = char>,
+    {
+        let width = usize::from(width.max(1));
+        let mut row: usize = 0;
+        let mut col: usize = 0;
+
+        for c in chars {
             if c == '\n' {
                 row += 1;
                 col = 0;
-            } else {
-                col += 1;
+                continue;
             }
+
+            let char_width = UnicodeWidthChar::width(c).unwrap_or(0).max(1);
+            if col > 0 && col.saturating_add(char_width) > width {
+                row += 1;
+                col = 0;
+            }
+            col = col.saturating_add(char_width);
         }
+
         (row, col)
     }
 
@@ -94,7 +143,12 @@ impl TextInput {
 
 impl Component for TextInput {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        let newline_modifiers = KeyModifiers::ALT | KeyModifiers::SHIFT;
         match key.code {
+            KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_char('\n');
+                EventResult::Consumed
+            }
             KeyCode::Char(c) => {
                 self.insert_char(c);
                 EventResult::Consumed
@@ -123,7 +177,7 @@ impl Component for TextInput {
                 self.move_cursor_end();
                 EventResult::Consumed
             }
-            KeyCode::Enter if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+            KeyCode::Enter if key.modifiers.intersects(newline_modifiers) => {
                 self.insert_char('\n');
                 EventResult::Consumed
             }
@@ -148,20 +202,22 @@ impl Component for TextInput {
             ratatui::style::Style::default().dim()
         };
 
-        let input = Paragraph::new(display_text.as_str()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title("Message".bold()),
-        );
+        let input = Paragraph::new(display_text.as_str())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title("Message".bold()),
+            )
+            .wrap(Wrap { trim: false });
 
         frame.render_widget(input, area);
 
         if focused {
-            let (row, col) = self.cursor_row_col();
             // Clamp to inner area (subtract 2 for borders, +1 for offset)
             let max_row = area.height.saturating_sub(2);
             let max_col = area.width.saturating_sub(2);
+            let (row, col) = self.cursor_visual_row_col(max_col);
             #[expect(clippy::cast_possible_truncation, reason = "bounded by visible area")]
             let (row_u16, col_u16) = (row as u16, col as u16);
             let cursor_y = area.y + row_u16.min(max_row.saturating_sub(1)) + 1;
@@ -173,7 +229,11 @@ impl Component for TextInput {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::action::Action;
+    use crate::components::input::TextInput;
+    use crate::components::{Component, EventResult};
 
     #[test]
     fn insert_and_get_text() {
@@ -274,28 +334,65 @@ mod tests {
     fn alt_enter_inserts_newline() {
         let mut input = TextInput::new();
         input.insert_char('a');
-        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::ALT);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
         let result = input.handle_key(key);
         assert!(matches!(result, EventResult::Consumed));
         input.insert_char('b');
         assert_eq!(input.get_text(), "a\nb");
-        assert_eq!(input.line_count(), 2);
+        assert_eq!(input.visual_line_count(80), 2);
     }
 
     #[test]
-    fn cursor_row_col_tracks_newlines() {
+    fn shift_enter_inserts_newline() {
+        let mut input = TextInput::new();
+        input.insert_char('a');
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let result = input.handle_key(key);
+        assert!(matches!(result, EventResult::Consumed));
+        input.insert_char('b');
+        assert_eq!(input.get_text(), "a\nb");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline() {
+        let mut input = TextInput::new();
+        input.insert_char('a');
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let result = input.handle_key(key);
+        assert!(matches!(result, EventResult::Consumed));
+        input.insert_char('b');
+        assert_eq!(input.get_text(), "a\nb");
+    }
+
+    #[test]
+    fn paste_preserves_multiline_text() {
+        let mut input = TextInput::new();
+        input.insert_text("a\r\n\tb\nc");
+        assert_eq!(input.get_text(), "a\n    b\nc");
+        assert_eq!(input.visual_line_count(80), 3);
+    }
+
+    #[test]
+    fn visual_line_count_includes_soft_wraps() {
+        let mut input = TextInput::new();
+        input.insert_text("abcd\nef");
+        assert_eq!(input.visual_line_count(3), 3);
+    }
+
+    #[test]
+    fn cursor_visual_row_col_tracks_newlines() {
         let mut input = TextInput::new();
         input.insert_char('a');
         input.insert_char('b');
         input.insert_char('\n');
         input.insert_char('c');
-        assert_eq!(input.cursor_row_col(), (1, 1));
+        assert_eq!(input.cursor_visual_row_col(80), (1, 1));
 
         input.move_cursor_home();
-        assert_eq!(input.cursor_row_col(), (0, 0));
+        assert_eq!(input.cursor_visual_row_col(80), (0, 0));
 
         input.move_cursor_end();
-        assert_eq!(input.cursor_row_col(), (1, 1));
+        assert_eq!(input.cursor_visual_row_col(80), (1, 1));
     }
 
     #[test]

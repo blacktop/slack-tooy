@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Report, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
@@ -41,6 +42,20 @@ enum LoadReason {
     ThreadClose,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalBell {
+    Idle,
+    Pending,
+}
+
+#[derive(Debug)]
+struct UploadCommand {
+    path: PathBuf,
+    initial_comment: Option<String>,
+}
+
+const UPLOAD_USAGE: &str = "Usage: /upload <path> [comment]";
+
 pub struct App {
     pub config: Config,
     pub mode: Mode,
@@ -66,6 +81,7 @@ pub struct App {
     poll_rotation: usize,
     /// Custom emoji name -> image URL (from emoji.list).
     custom_emoji_urls: HashMap<String, String>,
+    requested_file_images: HashSet<String>,
     /// Thread ts currently being fetched — thread mode enters only
     /// after replies arrive.
     pending_thread: Option<String>,
@@ -74,6 +90,7 @@ pub struct App {
     /// arrives so stale thread replies are never shown under the
     /// channel title.
     closing_thread: bool,
+    pending_terminal_bell: TerminalBell,
     /// Per-channel cutoff timestamps captured at `MarkAllRead` time.
     /// Messages at or before the cutoff are considered read; messages
     /// after are genuinely new and should trigger unread.
@@ -89,6 +106,136 @@ pub struct App {
     /// Number of `send_message` calls awaiting `MessageSent`.
     /// Input is cleared only when this reaches 0.
     pending_sends: u32,
+}
+
+fn parse_upload_command(text: &str) -> Result<Option<UploadCommand>, String> {
+    const COMMAND: &str = "/upload";
+    let trimmed = text.trim();
+    if trimmed == COMMAND {
+        return Err(UPLOAD_USAGE.to_string());
+    }
+    let Some(rest) = trimmed.strip_prefix("/upload ") else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Err(UPLOAD_USAGE.to_string());
+    }
+
+    let (path, comment) = parse_upload_parts(rest)?;
+    let comment = comment.trim();
+    let initial_comment = if comment.is_empty() {
+        None
+    } else {
+        Some(comment.to_string())
+    };
+
+    Ok(Some(UploadCommand {
+        path: PathBuf::from(path),
+        initial_comment,
+    }))
+}
+
+fn format_error_chain(prefix: &str, error: &Report) -> String {
+    let details = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if details.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}: {details}")
+    }
+}
+
+fn parse_upload_parts(input: &str) -> Result<(String, &str), String> {
+    if input.starts_with('"') {
+        parse_quoted_upload_path(input)
+    } else {
+        Ok(parse_plain_upload_path(input))
+    }
+}
+
+#[cfg(test)]
+mod upload_command_tests {
+    use super::{UPLOAD_USAGE, parse_upload_command};
+
+    #[test]
+    fn parse_upload_command_ignores_regular_messages() {
+        let parsed = parse_upload_command("hello /upload image.png");
+
+        assert!(matches!(parsed, Ok(None)));
+    }
+
+    #[test]
+    fn parse_upload_command_accepts_plain_path_and_comment() {
+        let parsed = parse_upload_command("/upload /tmp/cat.png look at this");
+        assert!(matches!(parsed, Ok(Some(_))));
+        let Ok(Some(parsed)) = parsed else {
+            return;
+        };
+
+        assert_eq!(parsed.path.to_string_lossy(), "/tmp/cat.png");
+        assert_eq!(parsed.initial_comment.as_deref(), Some("look at this"));
+    }
+
+    #[test]
+    fn parse_upload_command_accepts_quoted_path() {
+        let parsed = parse_upload_command(r#"/upload "/tmp/cat pic.png" caption"#);
+        assert!(matches!(parsed, Ok(Some(_))));
+        let Ok(Some(parsed)) = parsed else {
+            return;
+        };
+
+        assert_eq!(parsed.path.to_string_lossy(), "/tmp/cat pic.png");
+        assert_eq!(parsed.initial_comment.as_deref(), Some("caption"));
+    }
+
+    #[test]
+    fn parse_upload_command_rejects_missing_path() {
+        let parsed = parse_upload_command("/upload");
+
+        assert!(matches!(
+            parsed,
+            Err(ref message) if message == UPLOAD_USAGE
+        ));
+    }
+}
+
+fn parse_plain_upload_path(input: &str) -> (String, &str) {
+    match input.find(char::is_whitespace) {
+        Some(idx) => (input[..idx].to_string(), &input[idx..]),
+        None => (input.to_string(), ""),
+    }
+}
+
+fn parse_quoted_upload_path(input: &str) -> Result<(String, &str), String> {
+    let mut path = String::new();
+    let mut escaped = false;
+
+    for (idx, c) in input[1..].char_indices() {
+        if escaped {
+            path.push(c);
+            escaped = false;
+            continue;
+        }
+
+        match c {
+            '\\' => escaped = true,
+            '"' => {
+                let rest_index = idx + 1 + c.len_utf8();
+                return Ok((path, &input[rest_index..]));
+            }
+            c => path.push(c),
+        }
+    }
+
+    if escaped {
+        path.push('\\');
+    }
+    Err("Unclosed quoted upload path".to_string())
 }
 
 impl App {
@@ -121,8 +268,10 @@ impl App {
             latest_ts: HashMap::new(),
             poll_rotation: 0,
             custom_emoji_urls: HashMap::new(),
+            requested_file_images: HashSet::new(),
             pending_thread: None,
             closing_thread: false,
+            pending_terminal_bell: TerminalBell::Idle,
             mark_all_read_cutoffs: HashMap::new(),
             deferred_read_channel: None,
             status_message: Some("Loading channels...".into()),
@@ -151,10 +300,14 @@ impl App {
                 AppEvent::Tick => Action::Tick,
                 AppEvent::Resize => Action::Render,
                 AppEvent::Key(key) => self.handle_key(key),
+                AppEvent::Paste(text) => self.handle_paste(&text),
                 AppEvent::BackgroundAction(action) => action,
             };
 
             self.update(action);
+            if self.take_pending_terminal_bell() {
+                tui.ring_bell()?;
+            }
 
             if self.should_quit {
                 break;
@@ -215,6 +368,26 @@ impl App {
         match result {
             EventResult::Action(action) => action,
             _ => Action::Tick,
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Action {
+        if self.mode == Mode::Insert {
+            self.input.insert_text(text);
+        }
+        Action::Tick
+    }
+
+    fn take_pending_terminal_bell(&mut self) -> bool {
+        let should_ring = self.pending_terminal_bell == TerminalBell::Pending;
+        self.pending_terminal_bell = TerminalBell::Idle;
+        should_ring
+    }
+
+    fn mark_unread_and_maybe_bell(&mut self, channel_id: &str, should_bell: bool) {
+        let newly_unread = self.sidebar.unread_channels.insert(channel_id.to_string());
+        if newly_unread && should_bell {
+            self.pending_terminal_bell = TerminalBell::Pending;
         }
     }
 
@@ -287,6 +460,12 @@ impl App {
                 image_data,
             } => {
                 self.handle_avatar_downloaded(&user_id, &image_data);
+            }
+            Action::FileImageDownloaded {
+                image_key,
+                image_data,
+            } => {
+                self.handle_file_image_downloaded(&image_key, &image_data);
             }
             Action::StarsLoaded(starred) => {
                 self.sidebar.set_starred(starred);
@@ -414,13 +593,26 @@ impl App {
             return;
         };
         let text = self.input.get_text();
-        if !text.is_empty() {
-            let thread_ts = self.messages.active_thread.clone();
-            self.pending_sends += 1;
-            self.send_message(channel_id, text, thread_ts);
-            // Don't clear yet — cleared in MessageSent handler on success.
-            // On failure the draft stays intact for retry.
+        if text.is_empty() {
+            return;
         }
+
+        let thread_ts = self.messages.active_thread.clone();
+        let upload = match parse_upload_command(&text) {
+            Ok(upload) => upload,
+            Err(message) => {
+                self.status_message = Some(message);
+                return;
+            }
+        };
+        self.pending_sends += 1;
+        if let Some(upload) = upload {
+            self.upload_file(channel_id, upload, thread_ts);
+        } else {
+            self.send_message(channel_id, text, thread_ts);
+        }
+        // Don't clear yet — cleared in MessageSent handler on success.
+        // On failure the draft stays intact for retry.
     }
 
     fn handle_open_thread(&mut self, thread_ts: &str) {
@@ -458,15 +650,31 @@ impl App {
         if self.current_channel_id.as_deref() != Some(channel_id) {
             return;
         }
-        // Ignore stale responses if a different thread was requested
-        // or the user navigated away.
-        if self.pending_thread.as_deref() != Some(thread_ts) {
+        let read_marker_ts = self
+            .messages
+            .read_marker_ts()
+            .map(str::to_string)
+            .or_else(|| self.last_seen_ts.get(channel_id).cloned());
+        let is_opening_thread = self.pending_thread.as_deref() == Some(thread_ts);
+        let is_stable_active_thread = self.pending_thread.is_none()
+            && !self.closing_thread
+            && self.messages.active_thread.as_deref() == Some(thread_ts);
+
+        // Ignore stale responses if a different thread was requested,
+        // a different thread is active, or the user navigated away.
+        if !is_opening_thread && !is_stable_active_thread {
             return;
         }
-        self.pending_thread = None;
-        self.messages.set_thread(thread_ts.to_string(), messages);
+        if is_opening_thread {
+            self.pending_thread = None;
+            self.messages.set_thread(thread_ts.to_string(), messages);
+        } else {
+            self.messages.refresh_messages(messages);
+        }
+        self.messages.set_read_marker_ts(read_marker_ts);
         self.loading = false;
         self.resolve_missing_users();
+        self.resolve_file_images();
     }
 
     fn handle_channels_loaded(&mut self, channels: Vec<Channel>) {
@@ -521,9 +729,11 @@ impl App {
         is_background: bool,
     ) {
         // Track the newest message ts for unread detection
+        let read_marker_ts = self.last_seen_ts.get(channel_id).cloned();
         let newest_ts = messages.first().map(|m| m.ts.clone());
         if let Some(ref ts) = newest_ts {
             let prev = self.latest_ts.get(channel_id);
+            let had_session_baseline = prev.is_some();
             let is_new = prev.is_none_or(|p| ts.as_str() > p.as_str());
             if is_new {
                 self.latest_ts.insert(channel_id.to_string(), ts.clone());
@@ -540,7 +750,7 @@ impl App {
                         self.mark_all_read_cutoffs.remove(channel_id);
                         let is_current = self.current_channel_id.as_deref() == Some(channel_id);
                         if !is_current {
-                            self.sidebar.unread_channels.insert(channel_id.to_string());
+                            self.mark_unread_and_maybe_bell(channel_id, had_session_baseline);
                         }
                     }
                 } else {
@@ -548,7 +758,7 @@ impl App {
                     let last_seen = self.last_seen_ts.get(channel_id);
                     let unseen = last_seen.is_none_or(|s| ts.as_str() > s.as_str());
                     if !is_current && unseen {
-                        self.sidebar.unread_channels.insert(channel_id.to_string());
+                        self.mark_unread_and_maybe_bell(channel_id, had_session_baseline);
                     }
                 }
             }
@@ -609,15 +819,48 @@ impl App {
         } else {
             self.messages.refresh_messages(messages);
         }
+        self.messages.set_read_marker_ts(read_marker_ts);
         self.loading = false;
 
         self.resolve_missing_users();
+        self.resolve_file_images();
     }
 
     fn resolve_missing_users(&mut self) {
         let to_resolve = unresolved_user_ids(&self.messages.messages, &self.messages.user_cache);
         for user_id in to_resolve {
             self.resolve_user(user_id);
+        }
+    }
+
+    fn resolve_file_images(&mut self) {
+        if self.picker.is_none() {
+            return;
+        }
+
+        let requests = self
+            .messages
+            .messages
+            .iter()
+            .flat_map(|message| message.files.iter())
+            .filter_map(|file| {
+                if !file.is_image() {
+                    return None;
+                }
+                let image_key = file.image_key()?;
+                if self.messages.file_image_protocols.contains_key(&image_key)
+                    || self.requested_file_images.contains(&image_key)
+                {
+                    return None;
+                }
+                let image_url = file.image_url()?.to_string();
+                Some((image_key, image_url))
+            })
+            .collect::<Vec<_>>();
+
+        for (image_key, image_url) in requests {
+            self.requested_file_images.insert(image_key.clone());
+            self.download_file_image(image_key, image_url);
         }
     }
 
@@ -793,6 +1036,35 @@ impl App {
         });
     }
 
+    fn upload_file(&self, channel_id: String, upload: UploadCommand, thread_ts: Option<String>) {
+        let tx = self.action_tx.clone();
+        let client = self.slack.clone();
+        tokio::spawn(async move {
+            match client
+                .upload_file(
+                    &channel_id,
+                    &upload.path,
+                    upload.initial_comment.as_deref(),
+                    thread_ts.as_deref(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    let _ = tx.send(Action::MessageSent {
+                        channel_id,
+                        thread_ts,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Action::Error(format_error_chain(
+                        "Failed to upload file",
+                        &e,
+                    )));
+                }
+            }
+        });
+    }
+
     fn load_thread_replies(&self, channel_id: &str, thread_ts: &str) {
         self.spawn_fetch_thread(channel_id, thread_ts, false);
     }
@@ -866,6 +1138,24 @@ impl App {
         });
     }
 
+    fn download_file_image(&self, image_key: String, url: String) {
+        let tx = self.action_tx.clone();
+        let client = self.slack.clone();
+        tokio::spawn(async move {
+            match client.download_authenticated_bytes(&url).await {
+                Ok(data) => {
+                    let _ = tx.send(Action::FileImageDownloaded {
+                        image_key,
+                        image_data: data,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to download file image {image_key}: {e}");
+                }
+            }
+        });
+    }
+
     fn handle_avatar_downloaded(&mut self, user_id: &str, image_data: &[u8]) {
         let Some(ref mut picker) = self.picker else {
             return;
@@ -878,6 +1168,21 @@ impl App {
         self.messages
             .avatar_protocols
             .insert(user_id.to_string(), protocol);
+    }
+
+    fn handle_file_image_downloaded(&mut self, image_key: &str, image_data: &[u8]) {
+        let Some(ref mut picker) = self.picker else {
+            return;
+        };
+        let Ok(img) = image::load_from_memory(image_data) else {
+            tracing::warn!("Failed to decode file image {image_key}");
+            return;
+        };
+        let protocol = picker.new_resize_protocol(img);
+        self.messages
+            .file_image_protocols
+            .insert(image_key.to_string(), protocol);
+        self.messages.invalidate_cache();
     }
 
     fn load_custom_emoji(&self) {

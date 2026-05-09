@@ -21,8 +21,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(main_area);
 
-    // Grow input box to fit content (lines + 2 for borders), capped at 8.
-    let input_height = (app.input.line_count() + 2).min(8);
+    // Grow input box to fit rendered content (visual rows + borders), capped at 8.
+    let input_inner_width = right_area.width.saturating_sub(2);
+    let input_height = (app.input.visual_line_count(input_inner_width) + 2).min(8);
     let [messages_area, input_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(input_height)]).areas(right_area);
 
@@ -83,7 +84,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     // Context-aware hints
     let hints = match app.mode {
-        Mode::Insert => "Esc:normal Enter:send Opt+Enter:newline",
+        Mode::Insert => "Esc:normal Enter:send Opt/Shift+Enter:newline",
         Mode::Normal => match app.focus {
             Focus::Sidebar => {
                 "q:quit i:insert Tab:messages Enter:open R:read-all u:unread j/k:\u{2195}"

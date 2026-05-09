@@ -101,7 +101,8 @@ All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and 
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Alt+Enter` | Insert newline |
+| `Alt+Enter` / `Shift+Enter` | Insert newline |
+| `/upload <path> [comment]` | Upload a local image/file to the current chat |
 | `Esc` | Return to normal mode |
 | Arrow keys | Move cursor |
 | `Home` / `End` | Move to start / end of line |

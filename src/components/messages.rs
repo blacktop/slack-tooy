@@ -8,17 +8,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use ratatui_image::StatefulImage;
 use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{Resize, StatefulImage};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::Action;
 use crate::components::{Component, EventResult};
 use crate::emoji;
-use crate::slack::types::{Reaction, SlackMessage, replace_user_mentions};
+use crate::slack::types::{Reaction, SlackFile, SlackMessage, replace_user_mentions};
 
 const AVATAR_WIDTH: u16 = 4;
+const IMAGE_PREVIEW_HEIGHT: u16 = 8;
+const IMAGE_PREVIEW_WIDTH: u16 = 56;
 /// Right-side padding inside the messages panel (matches the 1-column
 /// gap the left border already provides).
 const MSG_RIGHT_PAD: u16 = 1;
@@ -34,8 +36,10 @@ pub struct MessageList {
     pub selected_message: usize,
     pub user_cache: HashMap<String, String>,
     pub avatar_protocols: HashMap<String, StatefulProtocol>,
+    pub file_image_protocols: HashMap<String, StatefulProtocol>,
     pub custom_emoji_urls: HashMap<String, String>,
     pub active_thread: Option<String>,
+    read_marker_ts: Option<String>,
     line_cache: Option<(usize, Vec<VisualLine>)>,
 }
 
@@ -48,8 +52,10 @@ impl MessageList {
             selected_message: 0,
             user_cache: HashMap::new(),
             avatar_protocols: HashMap::new(),
+            file_image_protocols: HashMap::new(),
             custom_emoji_urls: HashMap::new(),
             active_thread: None,
+            read_marker_ts: None,
             line_cache: None,
         }
     }
@@ -60,6 +66,7 @@ impl MessageList {
         self.scroll_offset = 0;
         self.selected_message = self.default_selection();
         self.active_thread = None;
+        self.read_marker_ts = None;
         self.line_cache = None;
     }
 
@@ -84,6 +91,15 @@ impl MessageList {
         self.scroll_offset = 0;
         self.selected_message = self.default_selection();
         self.line_cache = None;
+    }
+
+    pub fn set_read_marker_ts(&mut self, read_marker_ts: Option<String>) {
+        self.read_marker_ts = read_marker_ts;
+        self.line_cache = None;
+    }
+
+    pub fn read_marker_ts(&self) -> Option<&str> {
+        self.read_marker_ts.as_deref()
     }
 
     /// Number of messages in display order.
@@ -162,8 +178,17 @@ impl MessageList {
         };
         let mut lines: Vec<VisualLine> = Vec::new();
         let mut prev_user: Option<&str> = None;
+        let unread_count = self.unread_count(&display);
+        let first_unread_index = self.first_unread_index(&display);
 
         for (i, msg) in display.iter().enumerate() {
+            let starts_unread_section = first_unread_index == Some(i);
+            if starts_unread_section {
+                let separator = unread_separator_line(unread_count, text_width);
+                lines.push(VisualLine::separator(separator));
+                prev_user = None;
+            }
+
             let sender = msg.sender_id();
             let user_changed = prev_user != Some(sender);
 
@@ -183,7 +208,7 @@ impl MessageList {
                     .or(bot_name)
                     .unwrap_or(sender);
 
-                if i > 0 {
+                if i > 0 && !starts_unread_section {
                     // Separator belongs to the *new* message so it
                     // highlights together with the header.
                     lines.push(VisualLine::text(Line::from(""), i));
@@ -211,16 +236,25 @@ impl MessageList {
 
             for file in &msg.files {
                 let size = format_file_size(file.size);
-                let label = if file.name.is_empty() {
-                    format!("[file] ({size})")
+                let kind = if file.is_image() { "image" } else { "file" };
+                let name = file.display_name();
+                let label = if name.is_empty() {
+                    format!("[{kind}] ({size})")
                 } else {
-                    format!("[file] {} ({size})", file.name)
+                    format!("[{kind}] {name} ({size})")
                 };
                 for wrapped in wrap_text(&label, text_width) {
                     lines.push(VisualLine::text(
                         Line::from(Span::from(wrapped).fg(Color::Rgb(130, 170, 210))),
                         i,
                     ));
+                }
+
+                if let Some(image_key) = ready_image_key(file, &self.file_image_protocols) {
+                    lines.push(VisualLine::image(image_key, i));
+                    for _ in 1..IMAGE_PREVIEW_HEIGHT {
+                        lines.push(VisualLine::text(Line::from(""), i));
+                    }
                 }
             }
 
@@ -248,12 +282,30 @@ impl MessageList {
 
         lines
     }
+
+    fn unread_count(&self, display: &[&SlackMessage]) -> usize {
+        display
+            .iter()
+            .filter(|message| self.is_unread(message))
+            .count()
+    }
+
+    fn first_unread_index(&self, display: &[&SlackMessage]) -> Option<usize> {
+        display.iter().position(|message| self.is_unread(message))
+    }
+
+    fn is_unread(&self, message: &SlackMessage) -> bool {
+        self.read_marker_ts
+            .as_deref()
+            .is_some_and(|read_marker_ts| message.ts.as_str() > read_marker_ts)
+    }
 }
 
 struct VisualLine {
     line: Line<'static>,
     show_avatar: bool,
     user_id: String,
+    image_key: Option<String>,
     /// Display-order message index this line belongs to.
     msg_index: usize,
 }
@@ -264,6 +316,7 @@ impl VisualLine {
             line,
             show_avatar: false,
             user_id: String::new(),
+            image_key: None,
             msg_index,
         }
     }
@@ -273,6 +326,27 @@ impl VisualLine {
             line,
             show_avatar: true,
             user_id,
+            image_key: None,
+            msg_index,
+        }
+    }
+
+    fn separator(line: Line<'static>) -> Self {
+        Self {
+            line,
+            show_avatar: false,
+            user_id: String::new(),
+            image_key: None,
+            msg_index: usize::MAX,
+        }
+    }
+
+    fn image(image_key: String, msg_index: usize) -> Self {
+        Self {
+            line: Line::from(""),
+            show_avatar: false,
+            user_id: String::new(),
+            image_key: Some(image_key),
             msg_index,
         }
     }
@@ -425,6 +499,7 @@ impl Component for MessageList {
             }
 
             let is_selected = vline.msg_index == selected;
+            let image_area;
 
             if show_avatars {
                 let row = Rect::new(inner.x, y, content_width, 1);
@@ -439,40 +514,114 @@ impl Component for MessageList {
                     frame.render_stateful_widget(img, avatar_area, protocol);
                 }
 
-                let mut para = Paragraph::new(vline.line.clone());
-                if is_selected {
-                    para = para.style(highlight_bg);
-                }
-                frame.render_widget(para, text_area);
+                render_visual_line_text(frame, text_area, &vline.line, is_selected);
+                image_area = image_preview_area(text_area, inner);
             } else {
                 let row = Rect::new(inner.x, y, content_width, 1);
-                let mut para = Paragraph::new(vline.line.clone());
-                if is_selected {
-                    para = para.style(highlight_bg);
-                }
-                frame.render_widget(para, row);
+                render_visual_line_text(frame, row, &vline.line, is_selected);
+                image_area = image_preview_area(row, inner);
             }
 
-            // Fill the full row background for selected messages so
-            // the highlight extends to the right edge.
-            if is_selected {
-                let row = Rect::new(inner.x, y, inner.width, 1);
-                let buf = frame.buffer_mut();
-                for x in row.left()..row.right() {
-                    if let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_bg(SELECTED_MSG_BG);
-                    }
-                }
-            }
+            fill_selected_row_background(frame, inner, y, is_selected);
+            render_file_image_preview(
+                frame,
+                image_area,
+                vline.image_key.as_deref(),
+                &mut self.file_image_protocols,
+            );
         }
 
-        // Scrollbar
-        if total > visible_rows {
-            let mut scrollbar_state = ScrollbarState::new(total).position(offset);
-            let scrollbar = Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight);
-            frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+        render_scrollbar(frame, area, total, visible_rows, offset);
+    }
+}
+
+fn render_visual_line_text(frame: &mut Frame, area: Rect, line: &Line<'static>, is_selected: bool) {
+    let mut paragraph = Paragraph::new(line.clone());
+    if is_selected {
+        paragraph = paragraph.style(Style::default().bg(SELECTED_MSG_BG));
+    }
+    frame.render_widget(paragraph, area);
+}
+
+fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    total: usize,
+    visible_rows: usize,
+    offset: usize,
+) {
+    if total <= visible_rows {
+        return;
+    }
+
+    let mut scrollbar_state = ScrollbarState::new(total).position(offset);
+    let scrollbar = Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight);
+    frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+}
+
+fn fill_selected_row_background(frame: &mut Frame, inner: Rect, y: u16, is_selected: bool) {
+    if !is_selected {
+        return;
+    }
+
+    let row = Rect::new(inner.x, y, inner.width, 1);
+    let buf = frame.buffer_mut();
+    for x in row.left()..row.right() {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_bg(SELECTED_MSG_BG);
         }
     }
+}
+
+fn render_file_image_preview(
+    frame: &mut Frame,
+    area: Option<Rect>,
+    image_key: Option<&str>,
+    image_protocols: &mut HashMap<String, StatefulProtocol>,
+) {
+    let (Some(area), Some(image_key)) = (area, image_key) else {
+        return;
+    };
+    let Some(protocol) = image_protocols.get_mut(image_key) else {
+        return;
+    };
+
+    frame.render_stateful_widget(
+        StatefulImage::new().resize(Resize::Fit(None)),
+        area,
+        protocol,
+    );
+}
+
+fn ready_image_key(
+    file: &SlackFile,
+    image_protocols: &HashMap<String, StatefulProtocol>,
+) -> Option<String> {
+    let image_key = file.image_key()?;
+    if file.is_image() && image_protocols.contains_key(&image_key) {
+        Some(image_key)
+    } else {
+        None
+    }
+}
+
+fn image_preview_area(row: Rect, bounds: Rect) -> Option<Rect> {
+    if row.width == 0 || row.y >= bounds.y.saturating_add(bounds.height) {
+        return None;
+    }
+
+    let bottom = bounds.y.saturating_add(bounds.height);
+    let height = IMAGE_PREVIEW_HEIGHT.min(bottom.saturating_sub(row.y));
+    if height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        row.x,
+        row.y,
+        row.width.min(IMAGE_PREVIEW_WIDTH),
+        height,
+    ))
 }
 
 /// Wrap text to fit within the given display-column width.
@@ -584,6 +733,26 @@ fn split_to_width(text: &str, width: usize) -> (&str, &str, usize) {
     }
 
     (text, "", used_width)
+}
+
+fn unread_separator_line(unread_count: usize, width: usize) -> Line<'static> {
+    let label = if unread_count == 1 {
+        " New Message "
+    } else {
+        " New Messages "
+    };
+    let label_width = UnicodeWidthStr::width(label);
+
+    if width <= label_width {
+        return Line::from(Span::from(label.to_string()).fg(Color::Red));
+    }
+
+    let dash_count = width - label_width;
+    let left = dash_count / 2;
+    let right = dash_count - left;
+    let text = format!("{}{}{}", "-".repeat(left), label, "-".repeat(right));
+
+    Line::from(Span::from(text).fg(Color::Red))
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -716,6 +885,20 @@ mod tests {
     use crate::components::messages::{MessageList, wrap_text};
     use crate::slack::types::SlackMessage;
 
+    fn message(ts: &str, user: &str, text: &str) -> SlackMessage {
+        SlackMessage {
+            ts: ts.into(),
+            user: user.into(),
+            text: text.into(),
+            thread_ts: None,
+            reply_count: None,
+            reactions: Vec::new(),
+            files: Vec::new(),
+            bot_id: String::new(),
+            username: String::new(),
+        }
+    }
+
     #[test]
     fn wrap_text_preserves_whitespace_runs_when_wrapping() {
         let text = "  foo    bar";
@@ -755,17 +938,7 @@ mod tests {
     fn build_lines_replaces_user_mentions_with_cached_names() {
         let mut list = MessageList::new();
         list.user_cache = HashMap::from([(String::from("U2"), String::from("Alice"))]);
-        list.messages = vec![SlackMessage {
-            ts: "1.0".into(),
-            user: "U1".into(),
-            text: "hello <@U2>".into(),
-            thread_ts: None,
-            reply_count: None,
-            reactions: Vec::new(),
-            files: Vec::new(),
-            bot_id: String::new(),
-            username: String::new(),
-        }];
+        list.messages = vec![message("1.0", "U1", "hello <@U2>")];
 
         let lines = list.build_lines(80);
 
@@ -773,6 +946,56 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.line.to_string() == "hello @Alice")
+        );
+    }
+
+    #[test]
+    fn build_lines_inserts_unread_separator_before_first_unread_message() {
+        let mut list = MessageList::new();
+        // Channel storage is newest-first; display order becomes 1, 2, 3.
+        list.messages = vec![
+            message("3.0", "U1", "newer"),
+            message("2.0", "U1", "new"),
+            message("1.0", "U1", "old"),
+        ];
+        list.set_read_marker_ts(Some("1.0".to_string()));
+
+        let lines = list.build_lines(32);
+        let separator = lines
+            .iter()
+            .position(|line| line.line.to_string().contains("New Messages"));
+        let new_header = separator.and_then(|sep| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(sep + 1)
+                .find(|(_, line)| line.line.to_string().contains("U1"))
+                .map(|(idx, _)| idx)
+        });
+        let new_text = lines.iter().position(|line| line.line.to_string() == "new");
+
+        assert!(separator.is_some());
+        assert!(new_header.is_some_and(|idx| separator.is_some_and(|sep| idx > sep)));
+        assert!(new_text.is_some_and(|idx| new_header.is_some_and(|header| idx > header)));
+    }
+
+    #[test]
+    fn build_lines_uses_singular_unread_separator_for_one_message() {
+        let mut list = MessageList::new();
+        list.messages = vec![message("2.0", "U1", "new"), message("1.0", "U2", "old")];
+        list.set_read_marker_ts(Some("1.0".to_string()));
+
+        let lines = list.build_lines(32);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.line.to_string().contains("New Message"))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.line.to_string().contains("New Messages"))
         );
     }
 }

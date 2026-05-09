@@ -45,11 +45,62 @@ pub struct SlackMessage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SlackFile {
     #[serde(default)]
+    pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub title: String,
     #[serde(default)]
     pub size: u64,
     #[serde(default)]
     pub mimetype: String,
+    #[serde(default)]
+    pub url_private: String,
+    #[serde(default)]
+    pub url_private_download: String,
+    #[serde(default)]
+    pub thumb_360: String,
+    #[serde(default)]
+    pub thumb_480: String,
+    #[serde(default)]
+    pub thumb_720: String,
+    #[serde(default)]
+    pub thumb_1024: String,
+}
+
+impl SlackFile {
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.title
+        } else {
+            &self.name
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.mimetype.starts_with("image/")
+    }
+
+    pub fn image_url(&self) -> Option<&str> {
+        [
+            self.thumb_1024.as_str(),
+            self.thumb_720.as_str(),
+            self.thumb_480.as_str(),
+            self.thumb_360.as_str(),
+            self.url_private_download.as_str(),
+            self.url_private.as_str(),
+        ]
+        .into_iter()
+        .find(|url| !url.is_empty())
+    }
+
+    pub fn image_key(&self) -> Option<String> {
+        if self.id.is_empty() {
+            self.image_url().map(String::from)
+        } else {
+            Some(self.id.clone())
+        }
+    }
 }
 
 impl SlackMessage {
@@ -213,6 +264,24 @@ pub struct PostMessageData {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UploadUrlData {
+    pub upload_url: String,
+    pub file_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteUploadData {
+    #[serde(default)]
+    pub files: Vec<CompletedUploadFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletedUploadFile {
+    pub id: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UserInfoData {
     pub user: Option<User>,
 }
@@ -357,6 +426,41 @@ mod tests {
         let resp: SlackApiResponse<PostMessageData> = serde_json::from_str(json).expect("decode");
         assert!(resp.ok);
         assert_eq!(resp.data.ts.as_deref(), Some("1712500100.000300"));
+    }
+
+    #[test]
+    fn decode_get_upload_url_external() {
+        let json = r#"{
+            "ok": true,
+            "upload_url": "https://files.slack.com/upload/v1/ABC123",
+            "file_id": "F123ABC456"
+        }"#;
+        let resp: SlackApiResponse<UploadUrlData> = serde_json::from_str(json).expect("decode");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.data.upload_url,
+            "https://files.slack.com/upload/v1/ABC123"
+        );
+        assert_eq!(resp.data.file_id, "F123ABC456");
+    }
+
+    #[test]
+    fn decode_complete_upload_external() {
+        let json = r#"{
+            "ok": true,
+            "files": [
+                {
+                    "id": "F123ABC456",
+                    "title": "cat.png"
+                }
+            ]
+        }"#;
+        let resp: SlackApiResponse<CompleteUploadData> =
+            serde_json::from_str(json).expect("decode");
+        assert!(resp.ok);
+        assert_eq!(resp.data.files.len(), 1);
+        assert_eq!(resp.data.files[0].id, "F123ABC456");
+        assert_eq!(resp.data.files[0].title.as_deref(), Some("cat.png"));
     }
 
     #[test]

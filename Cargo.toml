@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rusqlite = { version = "0.35", features = ["bundled"] }
-ratatui-image = { version = "10", features = ["crossterm"] }
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 libc = "0.2"
 unicode-width = "0.2"
 
