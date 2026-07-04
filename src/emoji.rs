@@ -82,9 +82,9 @@ static EMOJI_MAP: &[(&str, &str)] = &[
     ("gem", "\u{1F48E}"),
     ("ghost", "\u{1F47B}"),
     ("gift", "\u{1F381}"),
+    ("grimacing", "\u{1F62C}"),
     ("grin", "\u{1F601}"),
     ("grinning", "\u{1F600}"),
-    ("grimacing", "\u{1F62C}"),
     ("guitar", "\u{1F3B8}"),
     ("hamburger", "\u{1F354}"),
     ("hammer", "\u{1F528}"),
@@ -141,15 +141,15 @@ static EMOJI_MAP: &[(&str, &str)] = &[
     ("poop", "\u{1F4A9}"),
     ("popcorn", "\u{1F37F}"),
     ("pray", "\u{1F64F}"),
-    ("raised_hands", "\u{1F64C}"),
     ("rainbow", "\u{1F308}"),
+    ("raised_hands", "\u{1F64C}"),
     ("relaxed", "\u{263A}\u{FE0F}"),
     ("relieved", "\u{1F60C}"),
     ("robot_face", "\u{1F916}"),
     ("rocket", "\u{1F680}"),
+    ("rofl", "\u{1F923}"),
     ("rolling_on_the_floor_laughing", "\u{1F923}"),
     ("rose", "\u{1F339}"),
-    ("rofl", "\u{1F923}"),
     ("rotating_light", "\u{1F6A8}"),
     ("round_pushpin", "\u{1F4CD}"),
     ("saluting_face", "\u{1FAE1}"),
@@ -207,3 +207,39 @@ static EMOJI_MAP: &[(&str, &str)] = &[
     ("zipper_mouth_face", "\u{1F910}"),
     ("zzz", "\u{1F4A4}"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{EMOJI_MAP, lookup};
+
+    /// `lookup` binary-searches, which silently returns None for any
+    /// entry that is out of order — enforce the precondition.
+    #[test]
+    fn emoji_map_is_strictly_sorted() {
+        for pair in EMOJI_MAP.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "EMOJI_MAP out of order: {:?} >= {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_finds_every_entry() {
+        for (name, unicode) in EMOJI_MAP {
+            assert_eq!(lookup(name), Some(*unicode), "lookup missed {name}");
+        }
+    }
+
+    #[test]
+    fn lookup_strips_skin_tone_suffix() {
+        assert_eq!(lookup("+1::skin-tone-4"), Some("\u{1F44D}"));
+    }
+
+    #[test]
+    fn lookup_unknown_returns_none() {
+        assert_eq!(lookup("definitely_not_an_emoji"), None);
+    }
+}

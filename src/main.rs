@@ -2,6 +2,7 @@ mod action;
 mod app;
 mod components;
 mod config;
+mod download;
 mod emoji;
 mod event;
 mod logging;
@@ -98,7 +99,7 @@ async fn main() -> Result<()> {
     let (action_tx, action_rx) = mpsc::unbounded_channel();
 
     let mut tui = Tui::new()?;
-    let mut app = App::new(config, action_tx, picker, store);
+    let mut app = App::new(config, action_tx, picker, store)?;
 
     tui.enter()?;
     let result = app.run(&mut tui, action_rx).await;

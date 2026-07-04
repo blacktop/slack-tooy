@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -28,6 +28,11 @@ const MSG_RIGHT_PAD: u16 = 1;
 /// Subtle background for the selected message highlight.
 const SELECTED_MSG_BG: Color = Color::Rgb(40, 40, 50);
 
+/// Cap on cached decoded image previews — each holds a decoded RGB
+/// buffer (several MB for a 1024px thumb), so an unbounded cache grows
+/// by hundreds of MB over a long session.
+const MAX_FILE_IMAGES: usize = 48;
+
 pub struct MessageList {
     pub messages: Vec<SlackMessage>,
     pub channel_name: String,
@@ -41,6 +46,21 @@ pub struct MessageList {
     pub active_thread: Option<String>,
     read_marker_ts: Option<String>,
     line_cache: Option<(usize, Vec<VisualLine>)>,
+    /// One-shot request to scroll the selected message into view on
+    /// the next render.  Set by selection changes only, so the free
+    /// line-scroll keys (j/k, Ctrl+u/d/…) are never overridden.
+    scroll_to_selected: bool,
+    /// Inner height of the most recently rendered viewport; used to
+    /// size half-page / full-page scrolling.
+    viewport_rows: u16,
+    /// Insertion order of `file_image_protocols`, oldest first, for
+    /// bounded eviction.
+    file_image_order: VecDeque<String>,
+    /// Inner (borderless) area of the last render, for mouse
+    /// hit-testing.  Zero-sized before the first render.
+    last_inner: Rect,
+    /// Index into the line cache of the first rendered row.
+    viewport_start: usize,
 }
 
 impl MessageList {
@@ -57,6 +77,11 @@ impl MessageList {
             active_thread: None,
             read_marker_ts: None,
             line_cache: None,
+            scroll_to_selected: true,
+            viewport_rows: 10,
+            file_image_order: VecDeque::new(),
+            last_inner: Rect::default(),
+            viewport_start: 0,
         }
     }
 
@@ -68,13 +93,20 @@ impl MessageList {
         self.active_thread = None;
         self.read_marker_ts = None;
         self.line_cache = None;
+        self.scroll_to_selected = true;
     }
 
     pub fn refresh_messages(&mut self, messages: Vec<SlackMessage>) {
         self.messages = messages;
-        self.selected_message = self
+        let clamped = self
             .selected_message
             .min(self.message_count().saturating_sub(1));
+        if clamped != self.selected_message {
+            // The list shrank under the selection — follow it so the
+            // highlight doesn't sit outside the viewport.
+            self.selected_message = clamped;
+            self.scroll_to_selected = true;
+        }
         self.line_cache = None;
     }
 
@@ -84,6 +116,7 @@ impl MessageList {
         self.scroll_offset = 0;
         self.selected_message = self.default_selection();
         self.line_cache = None;
+        self.scroll_to_selected = true;
     }
 
     pub fn close_thread(&mut self) {
@@ -91,6 +124,7 @@ impl MessageList {
         self.scroll_offset = 0;
         self.selected_message = self.default_selection();
         self.line_cache = None;
+        self.scroll_to_selected = true;
     }
 
     pub fn set_read_marker_ts(&mut self, read_marker_ts: Option<String>) {
@@ -119,6 +153,7 @@ impl MessageList {
             return;
         }
         self.selected_message = self.selected_message.saturating_sub(1);
+        self.scroll_to_selected = true;
     }
 
     fn select_next_message(&mut self) {
@@ -127,33 +162,127 @@ impl MessageList {
         }
         let max = self.message_count().saturating_sub(1);
         self.selected_message = (self.selected_message + 1).min(max);
+        self.scroll_to_selected = true;
+    }
+
+    fn half_page(&self) -> u16 {
+        (self.viewport_rows / 2).max(1)
+    }
+
+    fn full_page(&self) -> u16 {
+        self.viewport_rows.max(1)
+    }
+
+    /// Left click: select the message under the cursor.  The clicked
+    /// row is visible by definition, so the selection-follow scroll is
+    /// deliberately not armed.
+    pub fn handle_click(&mut self, position: Position) {
+        if !self.last_inner.contains(position) {
+            return;
+        }
+        let row = usize::from(position.y - self.last_inner.y);
+        let Some((_, lines)) = &self.line_cache else {
+            return;
+        };
+        let Some(vline) = lines.get(self.viewport_start + row) else {
+            return;
+        };
+        if vline.msg_index != usize::MAX {
+            self.selected_message = vline.msg_index;
+        }
+    }
+
+    /// Mouse wheel: free line scrolling, like j/k.
+    pub fn handle_scroll(&mut self, up: bool) {
+        const WHEEL_LINES: u16 = 3;
+        self.scroll_offset = if up {
+            self.scroll_offset.saturating_add(WHEEL_LINES)
+        } else {
+            self.scroll_offset.saturating_sub(WHEEL_LINES)
+        };
     }
 
     pub fn invalidate_cache(&mut self) {
         self.line_cache = None;
     }
 
-    /// Get the `thread_ts` for the currently selected message.
-    /// In channel view messages are stored newest-first but displayed
-    /// oldest-first, so we reverse-index.  In thread view order matches.
-    pub fn selected_message_thread_ts(&self) -> Option<&str> {
-        let display_idx = self.selected_message;
-        let msg = if self.active_thread.is_some() {
-            self.messages.get(display_idx)
+    /// Cache a decoded image preview, evicting the oldest entries past
+    /// [`MAX_FILE_IMAGES`].  Returns the evicted keys so the caller can
+    /// clear its requested-set and let them be re-fetched on revisit.
+    ///
+    /// Keys still referenced by the loaded messages are never evicted —
+    /// evicting a visible preview would make the next poll re-download
+    /// it, evicting another visible one, looping forever.  The cache
+    /// may therefore exceed the cap, bounded by the images in view.
+    pub fn insert_file_image(
+        &mut self,
+        image_key: String,
+        protocol: StatefulProtocol,
+    ) -> Vec<String> {
+        if self
+            .file_image_protocols
+            .insert(image_key.clone(), protocol)
+            .is_none()
+        {
+            self.file_image_order.push_back(image_key);
+        }
+
+        let mut evicted = Vec::new();
+        let excess = self
+            .file_image_protocols
+            .len()
+            .saturating_sub(MAX_FILE_IMAGES);
+        if excess > 0 {
+            let referenced: std::collections::HashSet<String> = self
+                .messages
+                .iter()
+                .flat_map(|message| message.files.iter())
+                .filter_map(SlackFile::image_key)
+                .collect();
+            let mut kept = VecDeque::with_capacity(self.file_image_order.len());
+            for key in std::mem::take(&mut self.file_image_order) {
+                if evicted.len() < excess && !referenced.contains(&key) {
+                    self.file_image_protocols.remove(&key);
+                    evicted.push(key);
+                } else {
+                    kept.push_back(key);
+                }
+            }
+            self.file_image_order = kept;
+        }
+        self.line_cache = None;
+        evicted
+    }
+
+    /// The currently selected message.  In channel view messages are
+    /// stored newest-first but displayed oldest-first, so we
+    /// reverse-index.  In thread view order matches.
+    fn selected_display_message(&self) -> Option<&SlackMessage> {
+        if self.active_thread.is_some() {
+            self.messages.get(self.selected_message)
         } else {
             // display is reversed: display 0 = last storage element
-            let len = self.messages.len();
-            if display_idx < len {
-                self.messages.get(len - 1 - display_idx)
-            } else {
-                None
-            }
-        }?;
+            self.messages
+                .len()
+                .checked_sub(self.selected_message + 1)
+                .and_then(|idx| self.messages.get(idx))
+        }
+    }
+
+    /// Get the `thread_ts` for the currently selected message.
+    pub fn selected_message_thread_ts(&self) -> Option<&str> {
+        let msg = self.selected_display_message()?;
         if msg.reply_count.unwrap_or(0) > 0 {
             Some(msg.ts.as_str())
         } else {
             msg.thread_ts.as_deref()
         }
+    }
+
+    /// Files attached to the currently selected message.
+    pub fn selected_message_files(&self) -> &[SlackFile] {
+        self.selected_display_message()
+            .map_or(&[][..], |msg| msg.files.as_slice())
     }
 
     fn get_or_build_lines(&mut self, text_width: usize) -> &[VisualLine] {
@@ -366,19 +495,19 @@ impl Component for MessageList {
                 EventResult::Consumed
             }
             (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.scroll_offset = self.scroll_offset.saturating_add(self.half_page());
                 EventResult::Consumed
             }
             (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.scroll_offset = self.scroll_offset.saturating_sub(self.half_page());
                 EventResult::Consumed
             }
             (KeyCode::Char('b'), true) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(20);
+                self.scroll_offset = self.scroll_offset.saturating_add(self.full_page());
                 EventResult::Consumed
             }
             (KeyCode::Char('f'), true) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                self.scroll_offset = self.scroll_offset.saturating_sub(self.full_page());
                 EventResult::Consumed
             }
             (KeyCode::Char('g'), false) => {
@@ -399,6 +528,9 @@ impl Component for MessageList {
                 self.select_next_message();
                 EventResult::Consumed
             }
+
+            // -- Download files on the selected message --
+            (KeyCode::Char('d'), false) => EventResult::Action(Action::DownloadFiles),
 
             // -- Thread: enter with l / → / Enter --
             (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, false) => {
@@ -442,6 +574,7 @@ impl Component for MessageList {
             .title(title.bold().cyan());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.last_inner = inner;
 
         if self.messages.is_empty() {
             return;
@@ -452,11 +585,15 @@ impl Component for MessageList {
         let content_width = inner.width.saturating_sub(MSG_RIGHT_PAD);
         let text_width = content_width.saturating_sub(avatar_col) as usize;
         let visible_rows = inner.height as usize;
+        self.viewport_rows = inner.height;
 
-        // Build / retrieve cached lines, then ensure the selected
-        // message is scrolled into view.
+        // Build / retrieve cached lines.  Scroll the selected message
+        // into view only when a selection change requested it —
+        // unconditional snapping would override the free line-scroll
+        // keys on every frame.
         let total = self.get_or_build_lines(text_width).len();
-        {
+        if self.scroll_to_selected {
+            self.scroll_to_selected = false;
             let lines = self.line_cache.as_ref().map_or(&[][..], |(_, v)| v);
             self.scroll_offset = ensure_selected_visible(
                 lines,
@@ -480,9 +617,9 @@ impl Component for MessageList {
         // Scroll: offset 0 = bottom (newest), higher = further back
         let end = total.saturating_sub(offset);
         let start = end.saturating_sub(visible_rows);
+        self.viewport_start = start;
 
         let selected = self.selected_message;
-        let highlight_bg = Style::default().bg(SELECTED_MSG_BG);
 
         // Render visible lines (need split borrow: cache vs avatar_protocols)
         let cached = self.line_cache.as_ref();
@@ -499,10 +636,9 @@ impl Component for MessageList {
             }
 
             let is_selected = vline.msg_index == selected;
-            let image_area;
+            let row = Rect::new(inner.x, y, content_width, 1);
 
-            if show_avatars {
-                let row = Rect::new(inner.x, y, content_width, 1);
+            let image_area = if show_avatars {
                 let [avatar_area, text_area] =
                     Layout::horizontal([Constraint::Length(avatar_col), Constraint::Fill(1)])
                         .areas(row);
@@ -515,12 +651,11 @@ impl Component for MessageList {
                 }
 
                 render_visual_line_text(frame, text_area, &vline.line, is_selected);
-                image_area = image_preview_area(text_area, inner);
+                image_preview_area(text_area, inner)
             } else {
-                let row = Rect::new(inner.x, y, content_width, 1);
                 render_visual_line_text(frame, row, &vline.line, is_selected);
-                image_area = image_preview_area(row, inner);
-            }
+                image_preview_area(row, inner)
+            };
 
             fill_selected_row_background(frame, inner, y, is_selected);
             render_file_image_preview(
@@ -804,7 +939,7 @@ fn format_reactions(
         let unicode = emoji::lookup(&r.name);
         let label = match unicode {
             Some(e) => format!("{e}\u{00A0}{}", r.count),
-            None => format!(":{}\u{00A0}{}", r.name, r.count),
+            None => format!(":{}:\u{00A0}{}", r.name, r.count),
         };
         let label_width = UnicodeWidthStr::width(label.as_str());
         let sep_width = if current_spans.is_empty() { 0 } else { 2 };
@@ -883,7 +1018,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::components::messages::{MessageList, wrap_text};
-    use crate::slack::types::SlackMessage;
+    use crate::slack::types::{SlackFile, SlackMessage};
 
     fn message(ts: &str, user: &str, text: &str) -> SlackMessage {
         SlackMessage {
@@ -920,6 +1055,140 @@ mod tests {
             wrapped,
             vec!["a".to_string(), "   ".to_string(), " b".to_string()]
         );
+    }
+
+    #[test]
+    fn selected_message_files_uses_display_order() {
+        let mut list = MessageList::new();
+        let mut with_file = message("2.0", "U1", "here you go");
+        with_file.files.push(SlackFile {
+            id: "F1".into(),
+            name: "report.pdf".into(),
+            title: String::new(),
+            size: 1,
+            mimetype: "application/pdf".into(),
+            url_private: String::new(),
+            url_private_download: String::new(),
+            thumb_360: String::new(),
+            thumb_480: String::new(),
+            thumb_720: String::new(),
+            thumb_1024: String::new(),
+        });
+        // Channel storage is newest-first: file message is newest.
+        list.set_channel(
+            vec![with_file, message("1.0", "U2", "old")],
+            "general".into(),
+        );
+
+        // Default selection is the newest message (last in display).
+        assert_eq!(list.selected_message_files().len(), 1);
+        assert_eq!(list.selected_message_files()[0].name, "report.pdf");
+
+        // Moving up selects the older message, which has no files.
+        list.select_prev_message();
+        assert!(list.selected_message_files().is_empty());
+    }
+
+    #[test]
+    fn scroll_keys_do_not_snap_back_to_selection() {
+        use crate::components::Component;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut list = MessageList::new();
+        list.set_channel(
+            vec![message("2.0", "U1", "new"), message("1.0", "U1", "old")],
+            "general".into(),
+        );
+        // Opening a channel requests one follow-scroll…
+        assert!(list.scroll_to_selected);
+        list.scroll_to_selected = false;
+
+        // …after which free scrolling must not re-arm it.
+        list.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(list.scroll_offset, 1);
+        assert!(!list.scroll_to_selected);
+
+        // Selection changes re-arm the follow-scroll.
+        list.select_prev_message();
+        assert!(list.scroll_to_selected);
+    }
+
+    #[test]
+    fn page_scroll_uses_viewport_height() {
+        use crate::components::Component;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut list = MessageList::new();
+        list.set_channel(vec![message("1.0", "U1", "hi")], "general".into());
+        list.viewport_rows = 30;
+
+        list.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(list.scroll_offset, 15);
+        list.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(list.scroll_offset, 45);
+    }
+
+    #[test]
+    fn click_selects_message_under_cursor() {
+        use ratatui::layout::{Position, Rect};
+
+        let mut list = MessageList::new();
+        // Display order: msg 0 = "old" (U2), msg 1 = "new" (U1).
+        list.set_channel(
+            vec![message("2.0", "U1", "new"), message("1.0", "U2", "old")],
+            "general".into(),
+        );
+        let _ = list.get_or_build_lines(32);
+        list.last_inner = Rect::new(1, 1, 32, 10);
+        list.viewport_start = 0;
+        list.scroll_to_selected = false;
+        assert_eq!(list.selected_message, 1); // newest selected by default
+
+        // Row 1 is "old"'s text line (row 0 is its header).
+        list.handle_click(Position::new(2, 2));
+
+        assert_eq!(list.selected_message, 0);
+        // The clicked row is visible — no follow-scroll snap.
+        assert!(!list.scroll_to_selected);
+
+        // Clicks outside the inner area are ignored.
+        list.handle_click(Position::new(0, 0));
+        assert_eq!(list.selected_message, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_moves_offset_without_snap() {
+        let mut list = MessageList::new();
+        list.set_channel(vec![message("1.0", "U1", "hi")], "general".into());
+        list.scroll_to_selected = false;
+
+        list.handle_scroll(true);
+        assert_eq!(list.scroll_offset, 3);
+        assert!(!list.scroll_to_selected);
+
+        list.handle_scroll(false);
+        assert_eq!(list.scroll_offset, 0);
+        // Clamped at the bottom.
+        list.handle_scroll(false);
+        assert_eq!(list.scroll_offset, 0);
+    }
+
+    #[test]
+    fn insert_file_image_evicts_oldest_beyond_cap() {
+        let mut list = MessageList::new();
+        let picker = ratatui_image::picker::Picker::halfblocks();
+
+        for i in 0..=super::MAX_FILE_IMAGES {
+            let img = image::DynamicImage::new_rgb8(1, 1);
+            let evicted = list.insert_file_image(format!("k{i}"), picker.new_resize_protocol(img));
+            if i < super::MAX_FILE_IMAGES {
+                assert!(evicted.is_empty());
+            } else {
+                assert_eq!(evicted, vec!["k0".to_string()]);
+            }
+        }
+        assert_eq!(list.file_image_protocols.len(), super::MAX_FILE_IMAGES);
+        assert!(!list.file_image_protocols.contains_key("k0"));
     }
 
     #[test]

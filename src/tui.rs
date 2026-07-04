@@ -2,9 +2,15 @@ use std::io::{self, Stdout, Write};
 
 use color_eyre::eyre::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -12,18 +18,55 @@ pub type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub struct Tui {
     terminal: CrosstermTerminal,
+    keyboard_enhanced: bool,
 }
 
 impl Tui {
     pub fn new() -> Result<Self> {
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            keyboard_enhanced: false,
+        })
+    }
+
+    /// Whether the terminal reports modified keys (kitty keyboard
+    /// protocol).  Without it Shift+Enter is indistinguishable from
+    /// plain Enter.
+    pub fn keyboard_enhanced(&self) -> bool {
+        self.keyboard_enhanced
     }
 
     pub fn enter(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        // Anything failing past raw mode must not strand the shell in
+        // a raw, alt-screen, mouse-captured state.
+        if let Err(e) = self.enter_screens() {
+            let _ = Self::reset();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn enter_screens(&mut self) -> Result<()> {
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
+
+        // Opt in to disambiguated key reports so modifiers on Enter
+        // (Shift+Enter newline) reach us.  The protocol is opt-in per
+        // application even on terminals that support it.
+        self.keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+        if self.keyboard_enhanced {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+        }
 
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
@@ -45,7 +88,20 @@ impl Tui {
 
     fn reset() -> Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
+        // Pop unconditionally: terminals without the kitty protocol
+        // ignore the sequence, and popping an empty stack is a no-op,
+        // so this is safe even when enter() never pushed.  Show the
+        // cursor here too — hide_cursor() sets a global mode that
+        // survives leaving the alternate screen, and this is the only
+        // cleanup the panic hook runs.
+        execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )?;
         Ok(())
     }
 

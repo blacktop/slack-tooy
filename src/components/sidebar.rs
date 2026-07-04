@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -28,6 +28,18 @@ pub struct ChannelSidebar {
     /// Index into `channels` (not filtered).
     pub selected: usize,
     scroll_offset: usize,
+    /// Inner (borderless) area of the last render, for mouse
+    /// hit-testing.  Zero-sized before the first render.
+    last_inner: Rect,
+}
+
+/// What a rendered sidebar row points at — built by `visible_rows`,
+/// which is the single source of truth for row order shared by
+/// rendering, selection math, and click mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTarget {
+    Header(Section),
+    Channel(usize),
 }
 
 impl ChannelSidebar {
@@ -41,6 +53,7 @@ impl ChannelSidebar {
             dm_names: HashMap::new(),
             selected: 0,
             scroll_offset: 0,
+            last_inner: Rect::default(),
         }
     }
 
@@ -80,9 +93,11 @@ impl ChannelSidebar {
             return;
         };
         let section = channel_section(&self.starred_channels, ch);
-        if self.collapsed_sections.contains(&section) {
-            self.collapsed_sections.remove(&section);
-        } else {
+        self.toggle_section(section);
+    }
+
+    fn toggle_section(&mut self, section: Section) {
+        if !self.collapsed_sections.remove(&section) {
             self.collapsed_sections.insert(section);
             self.snap_selection_to_visible();
         }
@@ -196,32 +211,66 @@ impl ChannelSidebar {
         if visible_height == 0 {
             return;
         }
-        let visual_row = self.visual_row_for_selected(visible);
-        if visual_row < self.scroll_offset {
-            self.scroll_offset = visual_row;
-        } else if visual_row >= self.scroll_offset + visible_height {
-            self.scroll_offset = visual_row - visible_height + 1;
+        let rows = self.visible_rows(visible);
+        let visual_row = rows
+            .iter()
+            .position(|row| *row == RowTarget::Channel(self.selected));
+        if let Some(visual_row) = visual_row {
+            if visual_row < self.scroll_offset {
+                self.scroll_offset = visual_row;
+            } else if visual_row >= self.scroll_offset + visible_height {
+                self.scroll_offset = visual_row - visible_height + 1;
+            }
         }
+        // The selection can be absent (filtered out, section
+        // collapsed) — never leave the view scrolled past the end.
+        self.scroll_offset = self
+            .scroll_offset
+            .min(rows.len().saturating_sub(visible_height));
     }
 
-    fn visual_row_for_selected(&self, visible: &[usize]) -> usize {
-        let mut row = 0;
-        for &(section, _) in &SECTIONS {
+    /// The rendered rows in display order: section headers followed by
+    /// their visible channels.
+    fn visible_rows(&self, visible: &[usize]) -> Vec<RowTarget> {
+        let mut rows = Vec::with_capacity(visible.len() + SECTIONS.len());
+        for &section in &SECTIONS {
             if !self.show_section_header(section, visible) {
                 continue;
             }
-            row += 1; // section header
+            rows.push(RowTarget::Header(section));
             for &ci in visible {
-                if channel_section(&self.starred_channels, &self.channels[ci]) != section {
-                    continue;
+                if channel_section(&self.starred_channels, &self.channels[ci]) == section {
+                    rows.push(RowTarget::Channel(ci));
                 }
-                if ci == self.selected {
-                    return row;
-                }
-                row += 1;
             }
         }
-        row
+        rows
+    }
+
+    /// Left click: a channel row selects and opens it; a section
+    /// header toggles collapse.  Returns the action to dispatch.
+    pub fn handle_click(&mut self, position: Position) -> Option<Action> {
+        if !self.last_inner.contains(position) {
+            return None;
+        }
+        let row = usize::from(position.y - self.last_inner.y) + self.scroll_offset;
+        let visible = self.visible_indices();
+        match self.visible_rows(&visible).get(row)? {
+            RowTarget::Header(section) => {
+                self.toggle_section(*section);
+                None
+            }
+            RowTarget::Channel(ci) => {
+                self.selected = *ci;
+                Some(Action::OpenChannel)
+            }
+        }
+    }
+
+    /// Mouse wheel: move the selection like j/k.  Scrolling the view
+    /// independently would fight `ensure_visible`'s selection-follow.
+    pub fn handle_scroll(&mut self, up: bool) {
+        self.move_selection(if up { -1 } else { 1 });
     }
 }
 
@@ -278,66 +327,64 @@ impl Component for ChannelSidebar {
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.last_inner = inner;
 
         let visible = self.visible_indices();
         let visible_height = inner.height as usize;
         self.ensure_visible(&visible, visible_height);
 
-        let mut lines: Vec<Line> = Vec::new();
-
         // Available columns for channel text (inside border, minus
         // right padding).
         let max_text_width = (inner.width as usize).saturating_sub(SIDEBAR_RIGHT_PAD);
 
-        for &(section, label) in &SECTIONS {
-            if !self.show_section_header(section, &visible) {
-                continue;
-            }
-            let collapsed = self.collapsed_sections.contains(&section);
-            let chevron = if collapsed { "▸" } else { "▾" };
-            lines.push(Line::from(format!(" {chevron} {label}")).bold().dim());
-
-            for &ci in &visible {
-                if channel_section(&self.starred_channels, &self.channels[ci]) != section {
-                    continue;
+        let mut lines: Vec<Line> = Vec::new();
+        for row in self.visible_rows(&visible) {
+            let line = match row {
+                RowTarget::Header(section) => {
+                    let collapsed = self.collapsed_sections.contains(&section);
+                    let chevron = if collapsed { "▸" } else { "▾" };
+                    Line::from(format!(" {chevron} {}", section.label()))
+                        .bold()
+                        .dim()
                 }
-                let ch = &self.channels[ci];
-                let is_dm = ch.is_im.unwrap_or(false);
-                let prefix = if is_dm { "  " } else { " # " };
-                let channel_label = self.channel_label(ch);
-                let selected = ci == self.selected;
-                let has_unread = self.unread_channels.contains(&ch.id);
+                RowTarget::Channel(ci) => {
+                    let ch = &self.channels[ci];
+                    let is_dm = ch.is_im.unwrap_or(false);
+                    let prefix = if is_dm { "  " } else { " # " };
+                    let channel_label = self.channel_label(ch);
+                    let selected = ci == self.selected;
+                    let has_unread = self.unread_channels.contains(&ch.id);
 
-                let gutter_width = 1;
-                let suffix_width = if has_unread && !selected { 2 } else { 0 };
-                let prefix_width = UnicodeWidthStr::width(prefix);
-                let label_budget =
-                    max_text_width.saturating_sub(gutter_width + prefix_width + suffix_width);
-                let display_label = truncate_with_ellipsis(&channel_label, label_budget);
-                let text = format!("{prefix}{display_label}");
+                    let gutter_width = 1;
+                    let suffix_width = if has_unread && !selected { 2 } else { 0 };
+                    let prefix_width = UnicodeWidthStr::width(prefix);
+                    let label_budget =
+                        max_text_width.saturating_sub(gutter_width + prefix_width + suffix_width);
+                    let display_label = truncate_with_ellipsis(&channel_label, label_budget);
+                    let text = format!("{prefix}{display_label}");
 
-                let line = if selected {
-                    Line::from(vec![
-                        Span::from(">").bold().cyan(),
-                        Span::from(text).bold().cyan(),
-                    ])
-                } else if has_unread {
-                    Line::from(vec![
-                        Span::from(" "),
-                        Span::from(text).bold().yellow(),
-                        Span::from(" *").bold().yellow(),
-                    ])
-                } else if is_dm {
-                    Line::from(vec![
-                        Span::from(" "),
-                        Span::from(text).fg(Color::Rgb(160, 165, 200)),
-                    ])
-                } else {
-                    Line::from(vec![Span::from(" "), Span::from(text)])
-                };
-
-                lines.push(line);
-            }
+                    if selected {
+                        Line::from(vec![
+                            Span::from(">").bold().cyan(),
+                            Span::from(text).bold().cyan(),
+                        ])
+                    } else if has_unread {
+                        Line::from(vec![
+                            Span::from(" "),
+                            Span::from(text).bold().yellow(),
+                            Span::from(" *").bold().yellow(),
+                        ])
+                    } else if is_dm {
+                        Line::from(vec![
+                            Span::from(" "),
+                            Span::from(text).fg(Color::Rgb(160, 165, 200)),
+                        ])
+                    } else {
+                        Line::from(vec![Span::from(" "), Span::from(text)])
+                    }
+                }
+            };
+            lines.push(line);
         }
 
         if lines.is_empty() && self.filter_unread {
@@ -366,11 +413,17 @@ enum Section {
     DirectMessages = 2,
 }
 
-const SECTIONS: [(Section, &str); 3] = [
-    (Section::Starred, "⭐ Starred"),
-    (Section::Channels, "# Channels"),
-    (Section::DirectMessages, "💬 Direct Messages"),
-];
+impl Section {
+    const fn label(self) -> &'static str {
+        match self {
+            Section::Starred => "⭐ Starred",
+            Section::Channels => "# Channels",
+            Section::DirectMessages => "💬 Direct Messages",
+        }
+    }
+}
+
+const SECTIONS: [Section; 3] = [Section::Starred, Section::Channels, Section::DirectMessages];
 
 fn channel_section(starred: &HashSet<String>, ch: &Channel) -> Section {
     if starred.contains(&ch.id) {
@@ -405,4 +458,155 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         end = i + ch.len_utf8();
     }
     format!("{}…", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            name: Some(name.into()),
+            is_channel: Some(true),
+            is_im: Some(false),
+            is_member: Some(true),
+            user: String::new(),
+        }
+    }
+
+    fn dm(id: &str, user: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            name: None,
+            is_channel: Some(false),
+            is_im: Some(true),
+            is_member: Some(true),
+            user: user.into(),
+        }
+    }
+
+    /// Sidebar with rows: [# Channels header, #alpha, #beta,
+    /// 💬 DMs header, dm U1] rendered into a 20x10 inner area.
+    fn rendered_sidebar() -> ChannelSidebar {
+        let mut sidebar = ChannelSidebar::new();
+        sidebar.set_channels(vec![
+            channel("C1", "alpha"),
+            channel("C2", "beta"),
+            dm("D1", "U1"),
+        ]);
+        sidebar.last_inner = Rect::new(1, 1, 20, 10);
+        sidebar
+    }
+
+    #[test]
+    fn click_on_channel_row_selects_and_opens() {
+        let mut sidebar = rendered_sidebar();
+
+        // Inner row 2 = second channel (#beta) after the section header.
+        let action = sidebar.handle_click(Position::new(3, 3));
+
+        assert!(matches!(action, Some(Action::OpenChannel)));
+        assert_eq!(
+            sidebar.selected_channel().map(|c| c.id.as_str()),
+            Some("C2")
+        );
+    }
+
+    #[test]
+    fn click_on_header_toggles_collapse() {
+        let mut sidebar = rendered_sidebar();
+
+        // Inner row 0 = "# Channels" header.
+        let action = sidebar.handle_click(Position::new(3, 1));
+
+        assert!(action.is_none());
+        assert!(sidebar.collapsed_sections.contains(&Section::Channels));
+        // Rows collapsed: header, DM header, DM — clicking again expands.
+        let action = sidebar.handle_click(Position::new(3, 1));
+        assert!(action.is_none());
+        assert!(!sidebar.collapsed_sections.contains(&Section::Channels));
+    }
+
+    #[test]
+    fn click_accounts_for_scroll_offset() {
+        let mut sidebar = rendered_sidebar();
+        sidebar.scroll_offset = 3;
+
+        // Inner row 0 + offset 3 = row 3 = "💬 Direct Messages" header.
+        let action = sidebar.handle_click(Position::new(3, 1));
+
+        assert!(action.is_none());
+        assert!(
+            sidebar
+                .collapsed_sections
+                .contains(&Section::DirectMessages)
+        );
+    }
+
+    #[test]
+    fn click_outside_inner_area_is_ignored() {
+        let mut sidebar = rendered_sidebar();
+
+        // (0, 0) is on the border, outside the inner rect.
+        assert!(sidebar.handle_click(Position::new(0, 0)).is_none());
+        assert_eq!(sidebar.selected, 0);
+    }
+
+    #[test]
+    fn click_past_last_row_is_ignored() {
+        let mut sidebar = rendered_sidebar();
+
+        // Row 8 is beyond the 5 rendered rows.
+        assert!(sidebar.handle_click(Position::new(3, 9)).is_none());
+        assert_eq!(sidebar.selected, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_moves_selection() {
+        let mut sidebar = rendered_sidebar();
+        assert_eq!(sidebar.selected, 0);
+
+        sidebar.handle_scroll(false);
+        assert_eq!(sidebar.selected, 1);
+        sidebar.handle_scroll(true);
+        assert_eq!(sidebar.selected, 0);
+        // Clamped at the top.
+        sidebar.handle_scroll(true);
+        assert_eq!(sidebar.selected, 0);
+    }
+
+    #[test]
+    fn visible_rows_matches_selection_math() {
+        let sidebar = rendered_sidebar();
+        let visible = sidebar.visible_indices();
+        let rows = sidebar.visible_rows(&visible);
+
+        assert_eq!(
+            rows,
+            vec![
+                RowTarget::Header(Section::Channels),
+                RowTarget::Channel(0),
+                RowTarget::Channel(1),
+                RowTarget::Header(Section::DirectMessages),
+                RowTarget::Channel(2),
+            ]
+        );
+        let _ = visible;
+    }
+
+    #[test]
+    fn ensure_visible_clamps_offset_when_selection_hidden() {
+        let mut sidebar = rendered_sidebar();
+        // Selection filtered out entirely (unread filter, nothing
+        // unread) with a stale deep scroll.
+        sidebar.filter_unread = true;
+        sidebar.scroll_offset = 10;
+
+        let visible = sidebar.visible_indices();
+        sidebar.ensure_visible(&visible, 5);
+
+        // Zero visible rows -> offset clamps to 0, view can't blank.
+        assert_eq!(sidebar.scroll_offset, 0);
+    }
 }

@@ -78,6 +78,7 @@ All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and 
 |-----|--------|
 | `j` / `k` | Move selection down / up |
 | `g` / `G` | Jump to first / last channel |
+| `z` / `Z` | Collapse current section / expand all sections |
 | `Enter` | Open channel |
 | `R` | Mark all channels as read |
 | `u` | Toggle unread-only filter |
@@ -91,6 +92,7 @@ All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and 
 | `l` / Right | Open thread for selected message |
 | `h` / Left | Close thread |
 | `Enter` | Open thread (alias for `l`) |
+| `d` | Download files on the selected message to `~/Downloads` |
 | `Esc` | Close thread |
 | `g` / `G` | Scroll to top / bottom |
 | `Ctrl+u` / `Ctrl+d` | Page up / down |
@@ -101,11 +103,27 @@ All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and 
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Alt+Enter` / `Shift+Enter` | Insert newline |
+| `Alt+Enter` / `Ctrl+J` | Insert newline |
+| `Shift+Enter` | Insert newline (terminals with the kitty keyboard protocol — kitty, Ghostty, foot, WezTerm with `enable_kitty_keyboard=true`; elsewhere it sends) |
 | `/upload <path> [comment]` | Upload a local image/file to the current chat |
 | `Esc` | Return to normal mode |
 | Arrow keys | Move cursor |
 | `Home` / `End` | Move to start / end of line |
+
+### Mouse
+
+| Action | Effect |
+|--------|--------|
+| Click a channel | Open it |
+| Click a section header | Collapse / expand the section |
+| Click a message | Select it |
+| Click the input box | Enter insert mode |
+| Scroll wheel over messages | Scroll history |
+| Scroll wheel over channels | Move selection |
+
+Mouse capture takes over the terminal's native text selection — hold `Shift`
+(most terminals) or `Option`/`Fn` (macOS Terminal.app/iTerm2) while dragging
+to select text normally.
 
 ## Data storage
 

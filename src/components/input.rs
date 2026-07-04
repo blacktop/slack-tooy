@@ -2,7 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::action::Action;
@@ -70,38 +71,8 @@ impl TextInput {
     /// Number of rendered rows needed for the input at a given inner
     /// width, including explicit newlines and soft wraps.
     pub fn visual_line_count(&self, width: u16) -> u16 {
-        let (row, _) = Self::wrapped_row_col(self.text.iter().copied(), width);
-        u16::try_from(row.saturating_add(1)).unwrap_or(u16::MAX)
-    }
-
-    fn cursor_visual_row_col(&self, width: u16) -> (usize, usize) {
-        Self::wrapped_row_col(self.text[..self.cursor_pos].iter().copied(), width)
-    }
-
-    fn wrapped_row_col<I>(chars: I, width: u16) -> (usize, usize)
-    where
-        I: IntoIterator<Item = char>,
-    {
-        let width = usize::from(width.max(1));
-        let mut row: usize = 0;
-        let mut col: usize = 0;
-
-        for c in chars {
-            if c == '\n' {
-                row += 1;
-                col = 0;
-                continue;
-            }
-
-            let char_width = UnicodeWidthChar::width(c).unwrap_or(0).max(1);
-            if col > 0 && col.saturating_add(char_width) > width {
-                row += 1;
-                col = 0;
-            }
-            col = col.saturating_add(char_width);
-        }
-
-        (row, col)
+        let (lines, _, _) = wrap_with_cursor(&self.text, self.text.len(), width);
+        u16::try_from(lines.len()).unwrap_or(u16::MAX)
     }
 
     fn insert_char(&mut self, c: char) {
@@ -194,37 +165,89 @@ impl Component for TextInput {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let display_text: String = self.text.iter().collect();
-
         let border_style = if focused {
             ratatui::style::Style::default().green()
         } else {
             ratatui::style::Style::default().dim()
         };
 
-        let input = Paragraph::new(display_text.as_str())
+        // Pre-wrap with the same algorithm used for cursor math and
+        // height sizing, so the drawn text, the box height, and the
+        // cursor cell can never disagree (ratatui's `Wrap` word-wraps,
+        // which diverges from the char-wrap the cursor math uses).
+        let inner_width = area.width.saturating_sub(2);
+        let inner_height = usize::from(area.height.saturating_sub(2));
+        let (lines, cursor_row, cursor_col) =
+            wrap_with_cursor(&self.text, self.cursor_pos, inner_width);
+
+        // Scroll just enough to keep the cursor row visible when the
+        // content is taller than the box.
+        let scroll_top = cursor_row.saturating_sub(inner_height.saturating_sub(1));
+
+        let text = Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>());
+        let input = Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
                     .title("Message".bold()),
             )
-            .wrap(Wrap { trim: false });
+            .scroll((u16::try_from(scroll_top).unwrap_or(u16::MAX), 0));
 
         frame.render_widget(input, area);
 
-        if focused {
-            // Clamp to inner area (subtract 2 for borders, +1 for offset)
-            let max_row = area.height.saturating_sub(2);
-            let max_col = area.width.saturating_sub(2);
-            let (row, col) = self.cursor_visual_row_col(max_col);
-            #[expect(clippy::cast_possible_truncation, reason = "bounded by visible area")]
-            let (row_u16, col_u16) = (row as u16, col as u16);
-            let cursor_y = area.y + row_u16.min(max_row.saturating_sub(1)) + 1;
-            let cursor_x = area.x + col_u16.min(max_col.saturating_sub(1)) + 1;
+        if focused && inner_height > 0 && inner_width > 0 {
+            let row = u16::try_from(cursor_row - scroll_top).unwrap_or(u16::MAX);
+            let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
+            let cursor_y = area.y + 1 + row;
+            let cursor_x = area.x + 1 + col.min(inner_width - 1);
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
+}
+
+/// Greedy character wrap of `text` at `width` display columns.
+/// Returns the wrapped lines plus the visual (row, col) of the char
+/// index `cursor` (the position where the next typed char lands).
+///
+/// This is the single source of truth for input layout: rendering,
+/// box-height sizing, and cursor placement all call it.
+fn wrap_with_cursor(text: &[char], cursor: usize, width: u16) -> (Vec<String>, usize, usize) {
+    let width = usize::from(width.max(1));
+    let mut lines = vec![String::new()];
+    let mut col: usize = 0;
+    let mut cursor_row = 0;
+    let mut cursor_col = 0;
+
+    for (i, &c) in text.iter().enumerate() {
+        if i == cursor {
+            cursor_row = lines.len() - 1;
+            cursor_col = col;
+        }
+
+        if c == '\n' {
+            lines.push(String::new());
+            col = 0;
+            continue;
+        }
+
+        let char_width = UnicodeWidthChar::width(c).unwrap_or(0).max(1);
+        if col > 0 && col.saturating_add(char_width) > width {
+            lines.push(String::new());
+            col = 0;
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(c);
+        }
+        col = col.saturating_add(char_width);
+    }
+
+    if cursor >= text.len() {
+        cursor_row = lines.len() - 1;
+        cursor_col = col;
+    }
+
+    (lines, cursor_row, cursor_col)
 }
 
 #[cfg(test)]
@@ -380,19 +403,60 @@ mod tests {
     }
 
     #[test]
-    fn cursor_visual_row_col_tracks_newlines() {
+    fn cursor_row_col_tracks_newlines() {
         let mut input = TextInput::new();
         input.insert_char('a');
         input.insert_char('b');
         input.insert_char('\n');
         input.insert_char('c');
-        assert_eq!(input.cursor_visual_row_col(80), (1, 1));
+        let cursor_at = |input: &TextInput| {
+            let (_, row, col) = super::wrap_with_cursor(&input.text, input.cursor_pos, 80);
+            (row, col)
+        };
+        assert_eq!(cursor_at(&input), (1, 1));
 
         input.move_cursor_home();
-        assert_eq!(input.cursor_visual_row_col(80), (0, 0));
+        assert_eq!(cursor_at(&input), (0, 0));
 
         input.move_cursor_end();
-        assert_eq!(input.cursor_visual_row_col(80), (1, 1));
+        assert_eq!(cursor_at(&input), (1, 1));
+    }
+
+    #[test]
+    fn wrap_with_cursor_char_wraps_mid_word() {
+        // Width 8: "hello world" must wrap after 8 columns, not at the
+        // word boundary — the cursor math depends on it.
+        let text: Vec<char> = "hello world".chars().collect();
+        let (lines, row, col) = super::wrap_with_cursor(&text, text.len(), 8);
+
+        assert_eq!(lines, vec!["hello wo".to_string(), "rld".to_string()]);
+        assert_eq!((row, col), (1, 3));
+    }
+
+    #[test]
+    fn wrap_with_cursor_counts_wide_chars_by_display_width() {
+        // Each emoji is 2 columns wide: only two fit in width 5.
+        let text: Vec<char> = "🦀🦀🦀".chars().collect();
+        let (lines, row, col) = super::wrap_with_cursor(&text, text.len(), 5);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "🦀🦀");
+        assert_eq!((row, col), (1, 2));
+    }
+
+    #[test]
+    fn wrap_with_cursor_line_count_matches_visual_line_count() {
+        let mut input = TextInput::new();
+        input.insert_text("abcd\nef");
+        let (lines, _, _) = super::wrap_with_cursor(&input.text, 0, 3);
+        assert_eq!(u16::try_from(lines.len()), Ok(input.visual_line_count(3)));
+    }
+
+    #[test]
+    fn wrap_with_cursor_empty_text_is_one_line() {
+        let (lines, row, col) = super::wrap_with_cursor(&[], 0, 10);
+        assert_eq!(lines, vec![String::new()]);
+        assert_eq!((row, col), (0, 0));
     }
 
     #[test]

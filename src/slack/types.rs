@@ -94,6 +94,16 @@ impl SlackFile {
         .find(|url| !url.is_empty())
     }
 
+    /// Full-file URL for saving to disk (never a thumbnail).
+    pub fn download_url(&self) -> Option<&str> {
+        [
+            self.url_private_download.as_str(),
+            self.url_private.as_str(),
+        ]
+        .into_iter()
+        .find(|url| !url.is_empty())
+    }
+
     pub fn image_key(&self) -> Option<String> {
         if self.id.is_empty() {
             self.image_url().map(String::from)
@@ -290,6 +300,7 @@ pub struct UserInfoData {
 pub struct StarsListData {
     #[serde(default)]
     pub items: Vec<StarItem>,
+    pub response_metadata: Option<ResponseMetadata>,
 }
 
 #[derive(Debug, Deserialize)]

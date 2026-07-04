@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use color_eyre::eyre::{Report, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use color_eyre::eyre::{Report, Result, WrapErr};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 use tokio::sync::mpsc;
 
-use crate::action::Action;
+use crate::action::{Action, ErrorContext};
 use crate::components::input::TextInput;
 use crate::components::messages::MessageList;
 use crate::components::sidebar::ChannelSidebar;
@@ -14,7 +15,7 @@ use crate::components::{Component, EventResult};
 use crate::config::Config;
 use crate::event::{AppEvent, EventHandler};
 use crate::slack::client::SlackClient;
-use crate::slack::types::{Channel, SlackMessage, is_slack_user_id, mentioned_user_ids};
+use crate::slack::types::{Channel, SlackFile, SlackMessage, is_slack_user_id, mentioned_user_ids};
 use crate::store::Store;
 use crate::tui::Tui;
 use crate::ui;
@@ -56,6 +57,45 @@ struct UploadCommand {
 
 const UPLOAD_USAGE: &str = "Usage: /upload <path> [comment]";
 
+/// Give up fetching an inline image preview after this many failures
+/// so a permanently broken URL doesn't retry forever, while transient
+/// failures still recover.
+const MAX_IMAGE_FETCH_ATTEMPTS: u32 = 3;
+
+/// Progress of one `d`-key download batch.  Files finish (or fail)
+/// independently; a single shared status line would let a later
+/// "Saved" overwrite an earlier failure.
+#[derive(Debug, Default)]
+struct DownloadBatch {
+    pending: usize,
+    total: usize,
+    failed: usize,
+    last_dest: Option<PathBuf>,
+    last_error: Option<String>,
+}
+
+impl DownloadBatch {
+    fn summary(&self) -> String {
+        if self.failed == 0 {
+            match (&self.last_dest, self.total) {
+                (Some(dest), 1) => format!("Saved {}", dest.display()),
+                (_, n) => format!("Saved {n} files"),
+            }
+        } else {
+            let error = self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Download failed".to_string());
+            format!("{error} ({} of {} failed)", self.failed, self.total)
+        }
+    }
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "loading/closing_thread/thread_poll_in_flight belong to one \
+              channel-view lifecycle pending a state-machine refactor"
+)]
 pub struct App {
     pub config: Config,
     pub mode: Mode,
@@ -82,6 +122,29 @@ pub struct App {
     /// Custom emoji name -> image URL (from emoji.list).
     custom_emoji_urls: HashMap<String, String>,
     requested_file_images: HashSet<String>,
+    /// Failed preview fetch attempts per image key — bounded retry.
+    failed_file_images: HashMap<String, u32>,
+    /// users.info requests already issued.  A failed lookup stays in
+    /// the set so it isn't re-fetched every poll cycle for the rest of
+    /// the session.
+    requested_users: HashSet<String>,
+    /// Authenticated user id from auth.test — used to avoid flagging
+    /// the user's own messages as unread.
+    self_user_id: Option<String>,
+    /// True while a quiet background thread poll is in flight.  Large
+    /// threads paginate and can outlive the poll interval; overlapping
+    /// fetches multiply the request rate.
+    thread_poll_in_flight: bool,
+    /// Draft captured at send time, restored into the input if the
+    /// send fails (unless the user typed something new meanwhile).
+    in_flight_send_text: Option<String>,
+    /// Progress of the current `d`-key download batch, if any.
+    download_batch: Option<DownloadBatch>,
+    /// Whether the terminal reports modified keys (kitty keyboard
+    /// protocol) — controls the Shift+Enter hint.
+    pub keyboard_enhanced: bool,
+    /// Pane rectangles from the last layout pass, for mouse routing.
+    pub panes: crate::ui::Panes,
     /// Thread ts currently being fetched — thread mode enters only
     /// after replies arrive.
     pending_thread: Option<String>,
@@ -131,9 +194,24 @@ fn parse_upload_command(text: &str) -> Result<Option<UploadCommand>, String> {
     };
 
     Ok(Some(UploadCommand {
-        path: PathBuf::from(path),
+        path: expand_tilde(&path),
         initial_comment,
     }))
+}
+
+/// Expand a leading `~` / `~/` to the home directory — the form people
+/// type interactively.  Other paths pass through unchanged.
+fn expand_tilde(path: &str) -> PathBuf {
+    let Some(home) = dirs::home_dir() else {
+        return PathBuf::from(path);
+    };
+    if path == "~" {
+        return home;
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(path),
+    }
 }
 
 fn format_error_chain(prefix: &str, error: &Report) -> String {
@@ -244,13 +322,13 @@ impl App {
         action_tx: mpsc::UnboundedSender<Action>,
         picker: Option<Picker>,
         store: Store,
-    ) -> Self {
-        let slack = SlackClient::new(&config.slack_token, &config.cookie);
+    ) -> Result<Self> {
+        let slack = SlackClient::new(&config.slack_token, &config.cookie)?;
 
         // Load persisted read state from SQLite
         let last_seen_ts = store.all_read_state().unwrap_or_default();
 
-        Self {
+        Ok(Self {
             config,
             mode: Mode::Normal,
             focus: Focus::Sidebar,
@@ -269,6 +347,14 @@ impl App {
             poll_rotation: 0,
             custom_emoji_urls: HashMap::new(),
             requested_file_images: HashSet::new(),
+            failed_file_images: HashMap::new(),
+            requested_users: HashSet::new(),
+            self_user_id: None,
+            thread_poll_in_flight: false,
+            in_flight_send_text: None,
+            download_batch: None,
+            keyboard_enhanced: false,
+            panes: crate::ui::Panes::default(),
             pending_thread: None,
             closing_thread: false,
             pending_terminal_bell: TerminalBell::Idle,
@@ -278,7 +364,7 @@ impl App {
             loading: true,
             load_reason: LoadReason::ChannelOpen,
             pending_sends: 0,
-        }
+        })
     }
 
     pub async fn run(
@@ -287,6 +373,7 @@ impl App {
         action_rx: mpsc::UnboundedReceiver<Action>,
     ) -> Result<()> {
         let mut events = EventHandler::new(self.config.tick_rate(), action_rx);
+        self.keyboard_enhanced = tui.keyboard_enhanced();
 
         self.validate_auth();
         self.load_channels();
@@ -300,6 +387,7 @@ impl App {
                 AppEvent::Tick => Action::Tick,
                 AppEvent::Resize => Action::Render,
                 AppEvent::Key(key) => self.handle_key(key),
+                AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
                 AppEvent::Paste(text) => self.handle_paste(&text),
                 AppEvent::BackgroundAction(action) => action,
             };
@@ -378,6 +466,49 @@ impl App {
         Action::Tick
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.handle_left_click(position),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = mouse.kind == MouseEventKind::ScrollUp;
+                if self.panes.messages.contains(position) {
+                    self.messages.handle_scroll(up);
+                } else if self.panes.sidebar.contains(position) {
+                    self.sidebar.handle_scroll(up);
+                }
+                Action::Tick
+            }
+            MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Up(_)
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::Moved
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => Action::Tick,
+        }
+    }
+
+    fn handle_left_click(&mut self, position: Position) -> Action {
+        if self.panes.sidebar.contains(position) {
+            self.mode = Mode::Normal;
+            // A channel row returns OpenChannel (which focuses the
+            // messages pane); header/empty clicks just take focus.
+            if let Some(action) = self.sidebar.handle_click(position) {
+                return action;
+            }
+            return Action::FocusSidebar;
+        }
+        if self.panes.messages.contains(position) {
+            self.mode = Mode::Normal;
+            self.messages.handle_click(position);
+            return Action::FocusMessages;
+        }
+        if self.panes.input.contains(position) {
+            return Action::EnterInsertMode;
+        }
+        Action::Tick
+    }
+
     fn take_pending_terminal_bell(&mut self) -> bool {
         let should_ring = self.pending_terminal_bell == TerminalBell::Pending;
         self.pending_terminal_bell = TerminalBell::Idle;
@@ -417,6 +548,12 @@ impl App {
             Action::SendMessage => {
                 self.handle_send_message();
             }
+            Action::DownloadFiles => {
+                self.handle_download_files();
+            }
+            Action::FileDownloaded { dest } => {
+                self.handle_download_finished(Ok(dest));
+            }
             Action::ChannelsLoaded(channels) => {
                 self.handle_channels_loaded(channels);
             }
@@ -434,19 +571,14 @@ impl App {
             } => {
                 self.handle_thread_replies_loaded(&channel_id, &thread_ts, messages);
             }
+            Action::ThreadPollFailed => {
+                self.thread_poll_in_flight = false;
+            }
             Action::MessageSent {
                 channel_id,
                 thread_ts,
             } => {
-                self.pending_sends = self.pending_sends.saturating_sub(1);
-                if self.pending_sends == 0 {
-                    self.input.clear();
-                }
-                if let Some(ref ts) = thread_ts {
-                    self.load_thread_replies(&channel_id, ts);
-                } else {
-                    self.load_messages(&channel_id);
-                }
+                self.handle_message_sent(&channel_id, thread_ts.as_deref());
             }
             Action::UserResolved {
                 user_id,
@@ -455,17 +587,14 @@ impl App {
             } => {
                 self.handle_user_resolved(user_id, &display_name, avatar_url);
             }
-            Action::AvatarDownloaded {
-                user_id,
-                image_data,
-            } => {
-                self.handle_avatar_downloaded(&user_id, &image_data);
+            Action::AvatarDownloaded { user_id, image } => {
+                self.handle_avatar_downloaded(&user_id, *image);
             }
-            Action::FileImageDownloaded {
-                image_key,
-                image_data,
-            } => {
-                self.handle_file_image_downloaded(&image_key, &image_data);
+            Action::FileImageDownloaded { image_key, image } => {
+                self.handle_file_image_downloaded(&image_key, *image);
+            }
+            Action::FileImageFailed { image_key } => {
+                self.handle_file_image_failed(&image_key);
             }
             Action::StarsLoaded(starred) => {
                 self.sidebar.set_starred(starred);
@@ -473,23 +602,109 @@ impl App {
             Action::CustomEmojiLoaded(emoji_map) => {
                 self.handle_custom_emoji_loaded(&emoji_map);
             }
-            Action::AuthValidated { user_name } => {
+            Action::AuthValidated { user_id, user_name } => {
                 tracing::info!("Authenticated as {user_name}");
+                self.self_user_id = Some(user_id);
             }
-            Action::Error(msg) => {
-                tracing::error!("{msg}");
-                self.status_message = Some(msg);
-                self.loading = false;
-                // Clear pending states so the user can retry the
-                // failed operation (thread open, thread close, send).
-                self.pending_thread = None;
-                self.closing_thread = false;
-                self.pending_sends = 0;
+            Action::Error { context, message } => {
+                self.handle_error(context, message);
             }
             Action::Tick => {
                 self.poll_if_due();
             }
             Action::Render => {}
+        }
+    }
+
+    /// Reset only the failed operation's pending state — an unrelated
+    /// failure must never clear the double-send guard, cancel an
+    /// in-flight thread open, or wipe the user's draft.
+    fn handle_error(&mut self, context: ErrorContext, message: String) {
+        tracing::error!("{message}");
+        match context {
+            ErrorContext::Download => {
+                self.handle_download_finished(Err(message));
+            }
+            ErrorContext::Send => {
+                self.status_message = Some(message);
+                self.pending_sends = 0;
+                // Restore the draft that failed to send so the user
+                // can fix and retry — unless they typed a new one.
+                let failed_draft = self.in_flight_send_text.take();
+                if self.input.is_empty()
+                    && let Some(text) = failed_draft
+                {
+                    self.input.insert_text(&text);
+                }
+            }
+            ErrorContext::ThreadOpen => {
+                self.status_message = Some(message);
+                self.pending_thread = None;
+                self.loading = false;
+            }
+            ErrorContext::ChannelLoad => {
+                self.status_message = Some(message);
+                self.closing_thread = false;
+                self.loading = false;
+            }
+            ErrorContext::ChannelList => {
+                self.status_message = Some(message);
+                self.loading = false;
+            }
+            ErrorContext::Auth => {
+                self.status_message = Some(message);
+            }
+        }
+    }
+
+    fn handle_download_finished(&mut self, outcome: std::result::Result<PathBuf, String>) {
+        let Some(batch) = self.download_batch.as_mut() else {
+            // Stray result after state reset — surface it directly.
+            self.status_message = Some(match outcome {
+                Ok(dest) => format!("Saved {}", dest.display()),
+                Err(message) => message,
+            });
+            return;
+        };
+
+        batch.pending = batch.pending.saturating_sub(1);
+        match outcome {
+            Ok(dest) => batch.last_dest = Some(dest),
+            Err(message) => {
+                batch.failed += 1;
+                batch.last_error = Some(message);
+            }
+        }
+
+        if batch.pending == 0 {
+            self.status_message = Some(batch.summary());
+            self.download_batch = None;
+        } else {
+            let done = batch.total - batch.pending;
+            self.status_message = Some(format!("Downloading... {done} of {} done", batch.total));
+        }
+    }
+
+    fn handle_file_image_failed(&mut self, image_key: &str) {
+        self.requested_file_images.remove(image_key);
+        *self
+            .failed_file_images
+            .entry(image_key.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn handle_message_sent(&mut self, channel_id: &str, thread_ts: Option<&str>) {
+        self.pending_sends = self.pending_sends.saturating_sub(1);
+        if self.pending_sends == 0 {
+            self.in_flight_send_text = None;
+        }
+        // Quiet refreshes: the send already succeeded, and a loud
+        // failure here would reset thread/channel state belonging to
+        // whatever the user is doing now.  The 5s poll self-heals.
+        if let Some(ts) = thread_ts {
+            self.load_thread_replies_quiet(channel_id, ts);
+        } else {
+            self.load_messages_refresh(channel_id);
         }
     }
 
@@ -509,7 +724,7 @@ impl App {
         // Cancel any in-flight thread fetch regardless of whether the
         // channel changed — re-opening the same channel while a thread
         // is loading should not drop into thread mode later.
-        self.pending_thread = None;
+        let cancelled_thread_open = self.pending_thread.take().is_some();
         if self.current_channel_id.as_deref() != Some(&channel_id) {
             self.flush_deferred_read();
             self.current_channel_id = Some(channel_id.clone());
@@ -521,18 +736,33 @@ impl App {
             self.loading = true;
             self.load_reason = LoadReason::ChannelOpen;
             self.load_messages(&channel_id);
+        } else if cancelled_thread_open {
+            // The cancelled thread fetch owned the loading flag; its
+            // response will be dropped as stale and would otherwise
+            // leave `loading` stuck until the next poll misread it as
+            // a channel open (mark-read + scroll reset).
+            self.loading = false;
+        } else if self.messages.active_thread.is_some() {
+            // Re-opening the current channel exits thread view — a
+            // click on the channel name means "back to the channel".
+            self.handle_close_thread();
         }
     }
 
     fn handle_mark_all_read(&mut self) {
         self.sidebar.mark_all_read();
         self.deferred_read_channel = None;
-        // Persist for channels with known timestamps.
+        // Persist for channels with known timestamps — one transaction
+        // so the event loop isn't stalled by a WAL sync per channel.
         for (ch_id, ts) in &self.latest_ts {
             self.last_seen_ts.insert(ch_id.clone(), ts.clone());
-            if let Err(e) = self.store.mark_read(ch_id, ts) {
-                tracing::warn!("Failed to persist read state: {e}");
-            }
+        }
+        let entries = self
+            .latest_ts
+            .iter()
+            .map(|(id, ts)| (id.as_str(), ts.as_str()));
+        if let Err(e) = self.store.mark_read_many(entries) {
+            tracing::warn!("Failed to persist read state: {e}");
         }
         // For channels that haven't been hydrated yet, record a
         // cutoff so that late background polls only suppress messages
@@ -557,6 +787,7 @@ impl App {
         display_name: &str,
         avatar_url: Option<String>,
     ) {
+        self.requested_users.remove(&user_id);
         self.messages
             .user_cache
             .insert(user_id.clone(), display_name.to_string());
@@ -606,13 +837,41 @@ impl App {
             }
         };
         self.pending_sends += 1;
+        // Clear immediately so keystrokes typed during the round-trip
+        // start a fresh draft instead of appending to the sent text.
+        // A send failure restores the draft (see handle_error).
+        self.in_flight_send_text = Some(text.clone());
+        self.input.clear();
         if let Some(upload) = upload {
             self.upload_file(channel_id, upload, thread_ts);
         } else {
             self.send_message(channel_id, text, thread_ts);
         }
-        // Don't clear yet — cleared in MessageSent handler on success.
-        // On failure the draft stays intact for retry.
+    }
+
+    fn handle_download_files(&mut self) {
+        // One batch at a time — an accidental double-press would spawn
+        // duplicate tasks and save "name (1).ext" copies.
+        if self.download_batch.is_some() {
+            self.status_message = Some("Download already in progress...".into());
+            return;
+        }
+        let files = self.messages.selected_message_files().to_vec();
+        if files.is_empty() {
+            self.status_message = Some("Selected message has no files".into());
+            return;
+        }
+        let batch = self.download_batch.get_or_insert_default();
+        batch.pending += files.len();
+        batch.total += files.len();
+        self.status_message = Some(match files.as_slice() {
+            [file] => format!("Downloading {}...", file.display_name()),
+            files => format!("Downloading {} files...", files.len()),
+        });
+        let dir = crate::download::download_dir();
+        for file in files {
+            self.download_file(file, dir.clone());
+        }
     }
 
     fn handle_open_thread(&mut self, thread_ts: &str) {
@@ -647,6 +906,7 @@ impl App {
         thread_ts: &str,
         messages: Vec<SlackMessage>,
     ) {
+        self.thread_poll_in_flight = false;
         if self.current_channel_id.as_deref() != Some(channel_id) {
             return;
         }
@@ -716,8 +976,12 @@ impl App {
         // Slack's rate limits for workspaces with many channels.
         self.poll_rotation = 0;
         // Force the next tick to fire a poll immediately by backdating
-        // last_poll by the poll interval.
-        if let Some(past) = Instant::now().checked_sub(self.config.poll_interval()) {
+        // last_poll by the poll interval.  Skip when the list came back
+        // empty: combined with poll_if_due's empty-list retry, the
+        // backdate would turn the retry into a request per tick.
+        if !self.sidebar.channels.is_empty()
+            && let Some(past) = Instant::now().checked_sub(self.config.poll_interval())
+        {
             self.last_poll = past;
         }
     }
@@ -731,6 +995,13 @@ impl App {
         // Track the newest message ts for unread detection
         let read_marker_ts = self.last_seen_ts.get(channel_id).cloned();
         let newest_ts = messages.first().map(|m| m.ts.clone());
+        // A newest message authored by this user is one they just sent
+        // (e.g. the post-send reload racing a channel switch) — never
+        // flag their own message as unread or ring the bell for it.
+        let newest_is_own = self
+            .self_user_id
+            .as_deref()
+            .is_some_and(|self_id| messages.first().is_some_and(|m| m.sender_id() == self_id));
         if let Some(ref ts) = newest_ts {
             let prev = self.latest_ts.get(channel_id);
             let had_session_baseline = prev.is_some();
@@ -738,10 +1009,22 @@ impl App {
             if is_new {
                 self.latest_ts.insert(channel_id.to_string(), ts.clone());
 
-                // If MarkAllRead recorded a cutoff for this channel,
-                // only suppress messages at or before that cutoff.
-                // Messages genuinely newer than the cutoff trigger unread.
-                if let Some(cutoff) = self.mark_all_read_cutoffs.get(channel_id) {
+                if newest_is_own {
+                    // Sending implies the user has seen the channel up
+                    // to their own message — advance the read marker
+                    // (otherwise older foreign messages hidden behind
+                    // the own ts could never flag unread again) and
+                    // skip the unread flag / bell entirely.
+                    self.last_seen_ts.insert(channel_id.to_string(), ts.clone());
+                    self.mark_all_read_cutoffs.remove(channel_id);
+                    if let Err(e) = self.store.mark_read(channel_id, ts) {
+                        tracing::warn!("Failed to persist read state: {e}");
+                    }
+                } else if let Some(cutoff) = self.mark_all_read_cutoffs.get(channel_id) {
+                    // If MarkAllRead recorded a cutoff for this channel,
+                    // only suppress messages at or before that cutoff.
+                    // Messages genuinely newer than the cutoff trigger
+                    // unread.
                     if ts.as_str() <= cutoff.as_str() {
                         self.last_seen_ts.insert(channel_id.to_string(), ts.clone());
                     } else {
@@ -848,8 +1131,13 @@ impl App {
                     return None;
                 }
                 let image_key = file.image_key()?;
+                let given_up = self
+                    .failed_file_images
+                    .get(&image_key)
+                    .is_some_and(|attempts| *attempts >= MAX_IMAGE_FETCH_ATTEMPTS);
                 if self.messages.file_image_protocols.contains_key(&image_key)
                     || self.requested_file_images.contains(&image_key)
+                    || given_up
                 {
                     return None;
                 }
@@ -865,32 +1153,54 @@ impl App {
     }
 
     fn poll_if_due(&mut self) {
+        // Background channels polled per cycle.  One per cycle
+        // hydrates unread state for large workspaces far too slowly
+        // (N channels -> N cycles); many more risks Slack's
+        // conversations.history rate limit (~50/min).
+        const BG_POLL_BATCH: usize = 3;
+
         if self.last_poll.elapsed() < self.config.poll_interval() {
             return;
         }
         self.last_poll = Instant::now();
 
+        // The channel list loads once at startup; if that failed the
+        // sidebar would stay empty forever — retry on the poll cadence.
+        if self.sidebar.channels.is_empty() {
+            if !self.loading {
+                self.loading = true;
+                self.load_channels();
+            }
+            return;
+        }
+
         // Refresh current view (errors suppressed — user already has
         // the messages and a transient failure shouldn't disrupt reading).
-        if let Some(ref channel_id) = self.current_channel_id {
-            if let Some(ref thread_ts) = self.messages.active_thread {
-                self.load_thread_replies_quiet(channel_id, thread_ts);
+        if let Some(channel_id) = self.current_channel_id.clone() {
+            if let Some(thread_ts) = self.messages.active_thread.clone() {
+                // Skip while the previous thread poll is in flight —
+                // large threads paginate and can outlive the poll
+                // interval, and overlapping fetches multiply the
+                // request rate against Slack's limits.
+                if !self.thread_poll_in_flight {
+                    self.thread_poll_in_flight = true;
+                    self.load_thread_replies_quiet(&channel_id, &thread_ts);
+                }
             } else {
-                self.load_messages_refresh(channel_id);
+                self.load_messages_refresh(&channel_id);
             }
         }
 
-        // Also poll one background channel per cycle
-        let channels = &self.sidebar.channels;
-        if channels.is_empty() {
-            return;
-        }
-        self.poll_rotation %= channels.len();
-        let bg_channel_id = channels[self.poll_rotation].id.clone();
-        self.poll_rotation += 1;
+        // Also poll a few background channels per cycle.
+        let channel_count = self.sidebar.channels.len();
+        for _ in 0..BG_POLL_BATCH.min(channel_count) {
+            self.poll_rotation %= channel_count;
+            let bg_channel_id = self.sidebar.channels[self.poll_rotation].id.clone();
+            self.poll_rotation += 1;
 
-        if self.current_channel_id.as_deref() != Some(&bg_channel_id) {
-            self.load_messages_background(&bg_channel_id);
+            if self.current_channel_id.as_deref() != Some(&bg_channel_id) {
+                self.load_messages_background(&bg_channel_id);
+            }
         }
     }
 
@@ -917,8 +1227,10 @@ impl App {
         let last_channel = self
             .store
             .get_session(crate::store::KEY_LAST_CHANNEL)
-            .ok()
-            .flatten();
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load saved session: {e}");
+                None
+            });
         if let Some(ref ch_id) = last_channel
             && let Some(idx) = self.sidebar.channels.iter().position(|c| c.id == *ch_id)
         {
@@ -936,13 +1248,15 @@ impl App {
             match client.auth_test().await {
                 Ok(info) => {
                     let _ = tx.send(Action::AuthValidated {
+                        user_id: info.user_id,
                         user_name: info.user,
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error(format!(
-                        "Auth failed: {e}. Check your token."
-                    )));
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::Auth,
+                        message: format!("Auth failed: {e}. Check your token."),
+                    });
                 }
             }
         });
@@ -957,7 +1271,10 @@ impl App {
                     let _ = tx.send(Action::ChannelsLoaded(channels));
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error(format!("Failed to load channels: {e}")));
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::ChannelList,
+                        message: format!("Failed to load channels: {e}"),
+                    });
                 }
             }
         });
@@ -1009,7 +1326,10 @@ impl App {
                     tracing::debug!("Poll failed for {channel_id}: {e}");
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error(format!("Failed to load messages: {e}")));
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::ChannelLoad,
+                        message: format!("Failed to load messages: {e}"),
+                    });
                 }
             }
         });
@@ -1030,7 +1350,10 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error(format!("Failed to send: {e}")));
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::Send,
+                        message: format!("Failed to send: {e}"),
+                    });
                 }
             }
         });
@@ -1056,10 +1379,10 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error(format_error_chain(
-                        "Failed to upload file",
-                        &e,
-                    )));
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::Send,
+                        message: format_error_chain("Failed to upload file", &e),
+                    });
                 }
             }
         });
@@ -1089,15 +1412,25 @@ impl App {
                 }
                 Err(e) if quiet => {
                     tracing::debug!("Thread poll failed for {channel_id}: {e}");
+                    let _ = tx.send(Action::ThreadPollFailed);
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error(format!("Failed to load thread: {e}")));
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::ThreadOpen,
+                        message: format!("Failed to load thread: {e}"),
+                    });
                 }
             }
         });
     }
 
-    fn resolve_user(&self, user_id: String) {
+    fn resolve_user(&mut self, user_id: String) {
+        // One users.info per id per session: an id that is already in
+        // flight, resolved, or failed must not be re-fetched by every
+        // 5s poll cycle.
+        if !self.requested_users.insert(user_id.clone()) {
+            return;
+        }
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
         tokio::spawn(async move {
@@ -1124,15 +1457,40 @@ impl App {
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
         tokio::spawn(async move {
-            match client.download_bytes(&url).await {
-                Ok(data) => {
+            let data = match client.download_bytes(&url).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!("Failed to download avatar for {user_id}: {e}");
+                    return;
+                }
+            };
+            match decode_image(data).await {
+                Ok(image) => {
                     let _ = tx.send(Action::AvatarDownloaded {
                         user_id,
-                        image_data: data,
+                        image: Box::new(image),
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to download avatar for {user_id}: {e}");
+                    tracing::warn!("Failed to decode avatar for {user_id}: {e}");
+                }
+            }
+        });
+    }
+
+    fn download_file(&self, file: SlackFile, dir: PathBuf) {
+        let tx = self.action_tx.clone();
+        let client = self.slack.clone();
+        tokio::spawn(async move {
+            match crate::download::save_file(&client, &file, &dir).await {
+                Ok(dest) => {
+                    let _ = tx.send(Action::FileDownloaded { dest });
+                }
+                Err(e) => {
+                    let _ = tx.send(Action::Error {
+                        context: ErrorContext::Download,
+                        message: format_error_chain("Failed to download file", &e),
+                    });
                 }
             }
         });
@@ -1142,47 +1500,51 @@ impl App {
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
         tokio::spawn(async move {
-            match client.download_authenticated_bytes(&url).await {
-                Ok(data) => {
+            let data = match client.download_bytes(&url).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!("Failed to download file image {image_key}: {e}");
+                    let _ = tx.send(Action::FileImageFailed { image_key });
+                    return;
+                }
+            };
+            match decode_image(data).await {
+                Ok(image) => {
                     let _ = tx.send(Action::FileImageDownloaded {
                         image_key,
-                        image_data: data,
+                        image: Box::new(image),
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to download file image {image_key}: {e}");
+                    tracing::warn!("Failed to decode file image {image_key}: {e}");
+                    let _ = tx.send(Action::FileImageFailed { image_key });
                 }
             }
         });
     }
 
-    fn handle_avatar_downloaded(&mut self, user_id: &str, image_data: &[u8]) {
+    fn handle_avatar_downloaded(&mut self, user_id: &str, image: image::DynamicImage) {
         let Some(ref mut picker) = self.picker else {
             return;
         };
-        let Ok(img) = image::load_from_memory(image_data) else {
-            tracing::warn!("Failed to decode avatar for {user_id}");
-            return;
-        };
-        let protocol = picker.new_resize_protocol(img);
+        let protocol = picker.new_resize_protocol(image);
         self.messages
             .avatar_protocols
             .insert(user_id.to_string(), protocol);
     }
 
-    fn handle_file_image_downloaded(&mut self, image_key: &str, image_data: &[u8]) {
+    fn handle_file_image_downloaded(&mut self, image_key: &str, image: image::DynamicImage) {
         let Some(ref mut picker) = self.picker else {
             return;
         };
-        let Ok(img) = image::load_from_memory(image_data) else {
-            tracing::warn!("Failed to decode file image {image_key}");
-            return;
-        };
-        let protocol = picker.new_resize_protocol(img);
-        self.messages
-            .file_image_protocols
-            .insert(image_key.to_string(), protocol);
-        self.messages.invalidate_cache();
+        let protocol = picker.new_resize_protocol(image);
+        self.failed_file_images.remove(image_key);
+        let evicted = self
+            .messages
+            .insert_file_image(image_key.to_string(), protocol);
+        for key in evicted {
+            self.requested_file_images.remove(&key);
+        }
     }
 
     fn load_custom_emoji(&self) {
@@ -1224,6 +1586,16 @@ impl App {
         // Share the URL map with the message renderer
         self.messages.custom_emoji_urls = self.custom_emoji_urls.clone();
     }
+}
+
+/// Decode on the blocking pool — a large image takes hundreds of ms,
+/// which would stall an async runtime worker (or the UI task, if
+/// decoded in `update()`).
+async fn decode_image(data: Vec<u8>) -> Result<image::DynamicImage> {
+    tokio::task::spawn_blocking(move || image::load_from_memory(&data))
+        .await
+        .wrap_err("Image decode task failed")?
+        .wrap_err("Failed to decode image")
 }
 
 fn unresolved_user_ids(
@@ -1271,7 +1643,7 @@ mod tests {
         let config = Config::default();
         let (tx, _rx) = mpsc::unbounded_channel();
         let store = Store::open_in_memory().expect("test store");
-        App::new(config, tx, None, store)
+        App::new(config, tx, None, store).expect("test app")
     }
 
     #[test]
@@ -1380,10 +1752,283 @@ mod tests {
         let mut app = test_app();
         app.loading = true;
 
-        app.update(Action::Error("oops".into()));
+        app.update(Action::Error {
+            context: ErrorContext::ChannelLoad,
+            message: "oops".into(),
+        });
 
         assert_eq!(app.status_message.as_deref(), Some("oops"));
         assert!(!app.loading);
+    }
+
+    #[test]
+    fn unrelated_error_does_not_reset_send_or_thread_state() {
+        let mut app = test_app();
+        app.pending_sends = 1;
+        app.pending_thread = Some("100.0".into());
+
+        // A download failure must not clear the double-send guard or
+        // cancel the in-flight thread open.
+        app.update(Action::Error {
+            context: ErrorContext::Download,
+            message: "download blew up".into(),
+        });
+
+        assert_eq!(app.pending_sends, 1);
+        assert_eq!(app.pending_thread.as_deref(), Some("100.0"));
+    }
+
+    #[test]
+    fn send_error_resets_guard_and_restores_draft() {
+        let mut app = test_app();
+        app.pending_sends = 1;
+        app.in_flight_send_text = Some("hello there".into());
+
+        app.update(Action::Error {
+            context: ErrorContext::Send,
+            message: "Failed to send: boom".into(),
+        });
+
+        assert_eq!(app.pending_sends, 0);
+        assert_eq!(app.input.get_text(), "hello there");
+    }
+
+    #[test]
+    fn send_error_keeps_newer_draft_typed_during_flight() {
+        let mut app = test_app();
+        app.pending_sends = 1;
+        app.in_flight_send_text = Some("old message".into());
+        app.input.insert_text("new draft");
+
+        app.update(Action::Error {
+            context: ErrorContext::Send,
+            message: "Failed to send: boom".into(),
+        });
+
+        assert_eq!(app.input.get_text(), "new draft");
+        assert!(app.in_flight_send_text.is_none());
+    }
+
+    #[test]
+    fn thread_open_error_clears_only_thread_state() {
+        let mut app = test_app();
+        app.pending_sends = 1;
+        app.pending_thread = Some("100.0".into());
+        app.loading = true;
+
+        app.update(Action::Error {
+            context: ErrorContext::ThreadOpen,
+            message: "Failed to load thread: boom".into(),
+        });
+
+        assert!(app.pending_thread.is_none());
+        assert!(!app.loading);
+        assert_eq!(app.pending_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn own_newest_message_does_not_mark_unread_or_bell() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C_CURRENT".into());
+        app.self_user_id = Some("U_ME".into());
+        // Baseline so a newer ts would normally trigger unread + bell.
+        app.latest_ts.insert("C_OTHER".into(), "1.0".into());
+
+        let mut own = msg("2.0");
+        own.user = "U_ME".into();
+        app.update(Action::MessagesLoaded {
+            channel_id: "C_OTHER".into(),
+            messages: vec![own],
+            is_background: true,
+        });
+
+        assert!(!app.sidebar.unread_channels.contains("C_OTHER"));
+        assert!(!app.take_pending_terminal_bell());
+        // Sending implies read: the marker must advance so older
+        // foreign messages don't resurface, and newer ones still do.
+        assert_eq!(
+            app.last_seen_ts.get("C_OTHER").map(String::as_str),
+            Some("2.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_newest_message_still_marks_unread() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C_CURRENT".into());
+        app.self_user_id = Some("U_ME".into());
+        app.latest_ts.insert("C_OTHER".into(), "1.0".into());
+
+        app.update(Action::MessagesLoaded {
+            channel_id: "C_OTHER".into(),
+            messages: vec![msg("2.0")],
+            is_background: true,
+        });
+
+        assert!(app.sidebar.unread_channels.contains("C_OTHER"));
+        assert!(app.take_pending_terminal_bell());
+    }
+
+    #[test]
+    fn download_batch_masks_nothing_on_mixed_results() {
+        let mut app = test_app();
+        app.download_batch = Some(DownloadBatch {
+            pending: 2,
+            total: 2,
+            ..DownloadBatch::default()
+        });
+
+        app.update(Action::Error {
+            context: ErrorContext::Download,
+            message: "Failed to download file: nope".into(),
+        });
+        app.update(Action::FileDownloaded {
+            dest: PathBuf::from("/tmp/ok.png"),
+        });
+
+        // The later success must not mask the earlier failure.
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Failed to download file: nope (1 of 2 failed)")
+        );
+        assert!(app.download_batch.is_none());
+    }
+
+    #[test]
+    fn download_files_refused_while_batch_pending() {
+        let mut app = test_app();
+        app.download_batch = Some(DownloadBatch {
+            pending: 1,
+            total: 1,
+            ..DownloadBatch::default()
+        });
+
+        app.update(Action::DownloadFiles);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Download already in progress...")
+        );
+        let batch = app.download_batch.as_ref().expect("batch still pending");
+        assert_eq!((batch.pending, batch.total), (1, 1));
+    }
+
+    #[test]
+    fn file_image_failure_allows_bounded_retries() {
+        let mut app = test_app();
+        app.requested_file_images.insert("F1".into());
+
+        for _ in 0..MAX_IMAGE_FETCH_ATTEMPTS {
+            app.update(Action::FileImageFailed {
+                image_key: "F1".into(),
+            });
+        }
+
+        // No longer marked in-flight, but permanently given up.
+        assert!(!app.requested_file_images.contains("F1"));
+        assert_eq!(app.failed_file_images.get("F1"), Some(&3));
+    }
+
+    #[test]
+    fn resolve_user_requests_each_id_once() {
+        let mut app = test_app();
+        // First call registers the id; nothing observable to assert on
+        // the spawn itself, so assert the guard set.
+        app.requested_users.insert("U_DUP".into());
+
+        app.resolve_user("U_DUP".into());
+
+        assert_eq!(app.requested_users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reopening_current_channel_cancels_pending_thread_and_loading() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        app.update(Action::OpenChannel);
+        app.loading = false;
+        // Thread open in flight: owns the loading flag.
+        app.update(Action::OpenThread("100.0".into()));
+        assert!(app.loading);
+        assert_eq!(app.pending_thread.as_deref(), Some("100.0"));
+
+        // Re-opening the same channel (click or Enter) cancels the
+        // fetch AND releases loading — otherwise the stale flag makes
+        // the next poll masquerade as a channel open.
+        app.update(Action::OpenChannel);
+
+        assert!(app.pending_thread.is_none());
+        assert!(!app.loading);
+    }
+
+    #[tokio::test]
+    async fn reopening_current_channel_closes_open_thread() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        app.update(Action::OpenChannel);
+        app.loading = false;
+        app.messages.set_thread("100.0".into(), vec![msg("100.0")]);
+
+        app.update(Action::OpenChannel);
+
+        // Clicking the channel name means "back to the channel view".
+        assert!(app.closing_thread);
+        assert!(app.loading);
+    }
+
+    #[test]
+    fn mouse_routes_by_pane() {
+        use ratatui::layout::Rect;
+
+        fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        let mut app = test_app();
+        app.panes = crate::ui::Panes {
+            sidebar: Rect::new(0, 0, 20, 20),
+            messages: Rect::new(20, 0, 60, 15),
+            input: Rect::new(20, 15, 60, 5),
+        };
+
+        // Click on the input pane enters insert mode.
+        let action = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 16));
+        assert!(matches!(action, Action::EnterInsertMode));
+
+        // Click on the sidebar (nothing rendered yet, so no channel
+        // hit) leaves insert mode and takes focus.
+        app.mode = Mode::Insert;
+        let action = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 5));
+        assert!(matches!(action, Action::FocusSidebar));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Wheel over the messages pane scrolls history.
+        let action = app.handle_mouse(mouse(MouseEventKind::ScrollUp, 30, 5));
+        assert!(matches!(action, Action::Tick));
+        assert_eq!(app.messages.scroll_offset, 3);
+
+        // Mouse events outside every pane are ignored.
+        let action = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 90, 30));
+        assert!(matches!(action, Action::Tick));
+    }
+
+    #[test]
+    fn upload_command_expands_tilde() {
+        let parsed = parse_upload_command("/upload ~/shot.png hi");
+        assert!(matches!(parsed, Ok(Some(_))));
+        let Ok(Some(parsed)) = parsed else {
+            return;
+        };
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(parsed.path, home.join("shot.png"));
+        }
+        assert_eq!(parsed.initial_comment.as_deref(), Some("hi"));
     }
 
     fn two_channels() -> Vec<Channel> {
@@ -1486,6 +2131,57 @@ mod tests {
         assert!(app.sidebar.filter_unread);
         // Selection should snap to C2 (the only unread channel)
         assert_eq!(app.sidebar.selected, 1);
+    }
+
+    #[test]
+    fn download_files_without_files_sets_status() {
+        let mut app = test_app();
+        app.messages.refresh_messages(vec![msg("1.0")]);
+
+        app.update(Action::DownloadFiles);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Selected message has no files")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_files_reports_selected_file_name() {
+        let mut app = test_app();
+        let mut message = msg("1.0");
+        message.files.push(SlackFile {
+            id: "F1".into(),
+            name: "report.pdf".into(),
+            title: String::new(),
+            size: 1,
+            mimetype: "application/pdf".into(),
+            url_private: String::new(),
+            url_private_download: String::new(),
+            thumb_360: String::new(),
+            thumb_480: String::new(),
+            thumb_720: String::new(),
+            thumb_1024: String::new(),
+        });
+        app.messages.refresh_messages(vec![message]);
+
+        app.update(Action::DownloadFiles);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Downloading report.pdf...")
+        );
+    }
+
+    #[test]
+    fn file_downloaded_sets_saved_status() {
+        let mut app = test_app();
+
+        app.update(Action::FileDownloaded {
+            dest: PathBuf::from("/tmp/report.pdf"),
+        });
+
+        assert_eq!(app.status_message.as_deref(), Some("Saved /tmp/report.pdf"));
     }
 
     #[test]

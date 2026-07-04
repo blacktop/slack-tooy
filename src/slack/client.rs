@@ -13,6 +13,10 @@ use crate::slack::types::{
 
 const SLACK_API_BASE: &str = "https://slack.com/api";
 const URLENCODE_HEX: &[u8; 16] = b"0123456789ABCDEF";
+/// Full-size file transfers (uploads and downloads) get a longer
+/// deadline than the 30s API timeout, which large attachments could
+/// not finish within.
+const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_mins(10);
 
 #[derive(Clone)]
 pub struct SlackClient {
@@ -23,7 +27,7 @@ pub struct SlackClient {
 }
 
 impl SlackClient {
-    pub fn new(token: &str, cookie: &str) -> Self {
+    pub fn new(token: &str, cookie: &str) -> Result<Self> {
         let cookie = if cookie.is_empty() {
             None
         } else {
@@ -34,12 +38,12 @@ impl SlackClient {
             .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| Client::new());
-        Self {
+            .wrap_err("Failed to build HTTP client (TLS backend unavailable?)")?;
+        Ok(Self {
             client,
             token: token.to_string(),
             cookie,
-        }
+        })
     }
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -171,15 +175,32 @@ impl SlackClient {
     }
 
     pub async fn list_stars(&self) -> Result<HashSet<String>> {
-        let params = vec![("limit", "200")];
-        let data: StarsListData = self.get("stars.list", &params).await?;
-        let starred = data
-            .items
-            .into_iter()
-            .filter(|item| matches!(item.item_type.as_str(), "channel" | "im" | "group" | "mpim"))
-            .map(|item| item.channel)
-            .filter(|id| !id.is_empty())
-            .collect();
+        let mut starred = HashSet::new();
+        let mut cursor = String::new();
+
+        loop {
+            let params = vec![("limit", "200"), ("cursor", &cursor)];
+            let data: StarsListData = self.get("stars.list", &params).await?;
+            starred.extend(
+                data.items
+                    .into_iter()
+                    .filter(|item| {
+                        matches!(item.item_type.as_str(), "channel" | "im" | "group" | "mpim")
+                    })
+                    .map(|item| item.channel)
+                    .filter(|id| !id.is_empty()),
+            );
+
+            match data
+                .response_metadata
+                .and_then(|m| m.next_cursor)
+                .filter(|c| !c.is_empty())
+            {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+
         Ok(starred)
     }
 
@@ -325,6 +346,7 @@ impl SlackClient {
         let resp = self
             .client
             .post(upload_url)
+            .timeout(FILE_TRANSFER_TIMEOUT)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes)
             .send()
@@ -377,15 +399,44 @@ impl SlackClient {
             .ok_or_else(|| color_eyre::eyre::eyre!("No user in response"))
     }
 
+    /// Attach the bearer token and session cookie only for Slack-hosted
+    /// URLs.  File URLs come from the API response and can point at
+    /// external providers (`files.remote.add`), which must never
+    /// receive our credentials.
+    fn apply_auth_for_host(
+        &self,
+        url: &str,
+        builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        if is_slack_host(url) {
+            self.apply_auth(builder)
+        } else {
+            builder
+        }
+    }
+
     pub async fn download_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.client.get(url).send().await?;
+        let builder = self.client.get(url);
+        let resp = self.apply_auth_for_host(url, builder).send().await?;
         Self::download_response_bytes(url, resp).await
     }
 
-    pub async fn download_authenticated_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let builder = self.client.get(url);
-        let resp = self.apply_auth(builder).send().await?;
-        Self::download_response_bytes(url, resp).await
+    /// Download streamed straight to `out` so large files never
+    /// buffer fully in memory.
+    pub async fn download_to(&self, url: &str, out: &mut tokio::fs::File) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let builder = self.client.get(url).timeout(FILE_TRANSFER_TIMEOUT);
+        let mut resp = self.apply_auth_for_host(url, builder).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("HTTP error downloading {url}: {status}");
+        }
+        while let Some(chunk) = resp.chunk().await? {
+            out.write_all(&chunk).await?;
+        }
+        out.flush().await?;
+        Ok(())
     }
 
     async fn download_response_bytes(url: &str, resp: reqwest::Response) -> Result<Vec<u8>> {
@@ -396,6 +447,20 @@ impl SlackClient {
         let bytes = resp.bytes().await?;
         Ok(bytes.to_vec())
     }
+}
+
+/// True when `url` points at slack.com or a subdomain (files.slack.com,
+/// workspace-name.slack.com).  Anything else is treated as external.
+fn is_slack_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    parsed
+        .host_str()
+        .is_some_and(|host| host == "slack.com" || host.ends_with(".slack.com"))
 }
 
 fn urlencoded_body(params: &[(&str, &str)]) -> String {
@@ -429,12 +494,27 @@ fn push_urlencoded_component(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::slack::client::urlencoded_body;
+    use crate::slack::client::{is_slack_host, urlencoded_body};
 
     #[test]
     fn urlencoded_body_encodes_spaces_punctuation_and_utf8() {
         let body = urlencoded_body(&[("filename", "cat pic&é.png"), ("length", "12")]);
 
         assert_eq!(body, "filename=cat+pic%26%C3%A9.png&length=12");
+    }
+
+    #[test]
+    fn is_slack_host_accepts_only_slack_domains_over_https() {
+        assert!(is_slack_host("https://slack.com/api/x"));
+        assert!(is_slack_host(
+            "https://files.slack.com/files-pri/T1-F1/cat.png"
+        ));
+        assert!(is_slack_host("https://myteam.slack.com/x"));
+
+        assert!(!is_slack_host("http://files.slack.com/downgraded"));
+        assert!(!is_slack_host("https://evil.com/files.slack.com/x"));
+        assert!(!is_slack_host("https://notslack.com/x"));
+        assert!(!is_slack_host("https://files.slack.com.evil.com/x"));
+        assert!(!is_slack_host("not a url"));
     }
 }

@@ -11,6 +11,16 @@ use crate::components::Component;
 /// Slack brand aubergine (dark purple).
 const SLACK_AUBERGINE: Color = Color::Rgb(74, 21, 75);
 
+/// Pane rectangles from the most recent layout pass, used to route
+/// mouse events.  Zero-sized rects (before the first render) contain
+/// no position, so early mouse events are safely ignored.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Panes {
+    pub sidebar: Rect,
+    pub messages: Rect,
+    pub input: Rect,
+}
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     let [main_area, status_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
@@ -23,9 +33,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Grow input box to fit rendered content (visual rows + borders), capped at 8.
     let input_inner_width = right_area.width.saturating_sub(2);
-    let input_height = (app.input.visual_line_count(input_inner_width) + 2).min(8);
+    let input_height = app
+        .input
+        .visual_line_count(input_inner_width)
+        .saturating_add(2)
+        .min(8);
     let [messages_area, input_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(input_height)]).areas(right_area);
+
+    app.panes = Panes {
+        sidebar: sidebar_area,
+        messages: messages_area,
+        input: input_area,
+    };
 
     app.sidebar
         .render(frame, sidebar_area, app.focus == Focus::Sidebar);
@@ -82,18 +102,20 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let used: usize = spans.iter().map(Span::width).sum();
     let remaining = (area.width as usize).saturating_sub(used);
 
-    // Context-aware hints
+    // Context-aware hints.  Shift+Enter only works on terminals with
+    // the kitty keyboard protocol; elsewhere it sends the message.
     let hints = match app.mode {
-        Mode::Insert => "Esc:normal Enter:send Opt/Shift+Enter:newline",
+        Mode::Insert if app.keyboard_enhanced => "Esc:normal Enter:send Opt/Shift+Enter:newline",
+        Mode::Insert => "Esc:normal Enter:send Opt+Enter/Ctrl+J:newline",
         Mode::Normal => match app.focus {
             Focus::Sidebar => {
                 "q:quit i:insert Tab:messages Enter:open R:read-all u:unread j/k:\u{2195}"
             }
             Focus::Messages => {
                 if app.messages.active_thread.is_some() {
-                    "q:quit i:reply h/\u{2190}:close J/K:msg j/k:line"
+                    "q:quit i:reply h/\u{2190}:close d:save J/K:msg j/k:line"
                 } else {
-                    "q:quit i:insert Tab:channels l/\u{2192}:thread J/K:msg j/k:line"
+                    "q:quit i:insert Tab:channels l/\u{2192}:thread d:save J/K:msg j/k:line"
                 }
             }
         },

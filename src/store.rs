@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, WrapErr};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub const KEY_LAST_CHANNEL: &str = "last_channel_id";
 
@@ -32,6 +32,7 @@ impl Store {
     fn init_schema(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
 
              CREATE TABLE IF NOT EXISTS read_state (
                  channel_id  TEXT PRIMARY KEY,
@@ -62,6 +63,33 @@ impl Store {
                 (channel_id, last_msg_ts),
             )
             .wrap_err("Failed to mark channel as read")?;
+        Ok(())
+    }
+
+    /// Mark many channels read in one transaction — one WAL sync
+    /// total instead of one per channel.
+    pub fn mark_read_many<'a, I>(&self, entries: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .wrap_err("Failed to start read-state transaction")?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO read_state (channel_id, last_msg_ts)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(channel_id) DO UPDATE
+                 SET last_msg_ts = excluded.last_msg_ts,
+                     updated_at  = strftime('%s','now')",
+            )?;
+            for (channel_id, last_msg_ts) in entries {
+                stmt.execute((channel_id, last_msg_ts))
+                    .wrap_err("Failed to mark channel as read")?;
+            }
+        }
+        tx.commit().wrap_err("Failed to commit read state")?;
         Ok(())
     }
 
@@ -98,8 +126,9 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT value FROM session WHERE key = ?1")?;
-        let result = stmt.query_row((key,), |row| row.get(0)).ok();
-        Ok(result)
+        stmt.query_row((key,), |row| row.get(0))
+            .optional()
+            .wrap_err("Failed to read session value")
     }
 }
 
