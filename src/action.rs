@@ -66,6 +66,9 @@ pub enum Action {
     MessageSent {
         channel_id: String,
         thread_ts: Option<String>,
+        /// Timestamp returned by `chat.postMessage`; file uploads do
+        /// not currently expose a channel message timestamp here.
+        message_ts: Option<String>,
     },
     ThreadRepliesLoaded {
         channel_id: String,

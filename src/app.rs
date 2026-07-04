@@ -577,8 +577,9 @@ impl App {
             Action::MessageSent {
                 channel_id,
                 thread_ts,
+                message_ts,
             } => {
-                self.handle_message_sent(&channel_id, thread_ts.as_deref());
+                self.handle_message_sent(&channel_id, thread_ts.as_deref(), message_ts.as_deref());
             }
             Action::UserResolved {
                 user_id,
@@ -693,10 +694,29 @@ impl App {
             .or_insert(0) += 1;
     }
 
-    fn handle_message_sent(&mut self, channel_id: &str, thread_ts: Option<&str>) {
+    fn mark_self_sent_message_read(&mut self, channel_id: &str, ts: &str) {
+        self.last_seen_ts
+            .insert(channel_id.to_string(), ts.to_string());
+        self.mark_all_read_cutoffs.remove(channel_id);
+        if let Err(e) = self.store.mark_read(channel_id, ts) {
+            tracing::warn!("Failed to persist read state: {e}");
+        }
+    }
+
+    fn handle_message_sent(
+        &mut self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        message_ts: Option<&str>,
+    ) {
         self.pending_sends = self.pending_sends.saturating_sub(1);
         if self.pending_sends == 0 {
             self.in_flight_send_text = None;
+        }
+        if thread_ts.is_none()
+            && let Some(ts) = message_ts
+        {
+            self.mark_self_sent_message_read(channel_id, ts);
         }
         // Quiet refreshes: the send already succeeded, and a loud
         // failure here would reset thread/channel state belonging to
@@ -995,9 +1015,10 @@ impl App {
         // Track the newest message ts for unread detection
         let read_marker_ts = self.last_seen_ts.get(channel_id).cloned();
         let newest_ts = messages.first().map(|m| m.ts.clone());
-        // A newest message authored by this user is one they just sent
-        // (e.g. the post-send reload racing a channel switch) — never
-        // flag their own message as unread or ring the bell for it.
+        // A self-authored newest message from history is ambiguous: it
+        // may have been sent by another client after unread teammate
+        // messages. Confirmed sends from this app advance read state in
+        // `handle_message_sent` using Slack's returned timestamp.
         let newest_is_own = self
             .self_user_id
             .as_deref()
@@ -1005,22 +1026,12 @@ impl App {
         if let Some(ref ts) = newest_ts {
             let prev = self.latest_ts.get(channel_id);
             let had_session_baseline = prev.is_some();
+            let should_bell_for_newest = had_session_baseline && !newest_is_own;
             let is_new = prev.is_none_or(|p| ts.as_str() > p.as_str());
             if is_new {
                 self.latest_ts.insert(channel_id.to_string(), ts.clone());
 
-                if newest_is_own {
-                    // Sending implies the user has seen the channel up
-                    // to their own message — advance the read marker
-                    // (otherwise older foreign messages hidden behind
-                    // the own ts could never flag unread again) and
-                    // skip the unread flag / bell entirely.
-                    self.last_seen_ts.insert(channel_id.to_string(), ts.clone());
-                    self.mark_all_read_cutoffs.remove(channel_id);
-                    if let Err(e) = self.store.mark_read(channel_id, ts) {
-                        tracing::warn!("Failed to persist read state: {e}");
-                    }
-                } else if let Some(cutoff) = self.mark_all_read_cutoffs.get(channel_id) {
+                if let Some(cutoff) = self.mark_all_read_cutoffs.get(channel_id) {
                     // If MarkAllRead recorded a cutoff for this channel,
                     // only suppress messages at or before that cutoff.
                     // Messages genuinely newer than the cutoff trigger
@@ -1033,7 +1044,7 @@ impl App {
                         self.mark_all_read_cutoffs.remove(channel_id);
                         let is_current = self.current_channel_id.as_deref() == Some(channel_id);
                         if !is_current {
-                            self.mark_unread_and_maybe_bell(channel_id, had_session_baseline);
+                            self.mark_unread_and_maybe_bell(channel_id, should_bell_for_newest);
                         }
                     }
                 } else {
@@ -1041,7 +1052,7 @@ impl App {
                     let last_seen = self.last_seen_ts.get(channel_id);
                     let unseen = last_seen.is_none_or(|s| ts.as_str() > s.as_str());
                     if !is_current && unseen {
-                        self.mark_unread_and_maybe_bell(channel_id, had_session_baseline);
+                        self.mark_unread_and_maybe_bell(channel_id, should_bell_for_newest);
                     }
                 }
             }
@@ -1343,10 +1354,11 @@ impl App {
                 .post_message(&channel_id, &text, thread_ts.as_deref())
                 .await
             {
-                Ok(()) => {
+                Ok(message_ts) => {
                     let _ = tx.send(Action::MessageSent {
                         channel_id,
                         thread_ts,
+                        message_ts,
                     });
                 }
                 Err(e) => {
@@ -1376,6 +1388,7 @@ impl App {
                     let _ = tx.send(Action::MessageSent {
                         channel_id,
                         thread_ts,
+                        message_ts: None,
                     });
                 }
                 Err(e) => {
@@ -1826,13 +1839,14 @@ mod tests {
         assert_eq!(app.pending_sends, 1);
     }
 
-    #[tokio::test]
-    async fn own_newest_message_does_not_mark_unread_or_bell() {
+    #[test]
+    fn confirmed_self_sent_message_advances_read_state_without_unread_or_bell() {
         let mut app = test_app();
         app.current_channel_id = Some("C_CURRENT".into());
         app.self_user_id = Some("U_ME".into());
         // Baseline so a newer ts would normally trigger unread + bell.
         app.latest_ts.insert("C_OTHER".into(), "1.0".into());
+        app.mark_self_sent_message_read("C_OTHER", "2.0");
 
         let mut own = msg("2.0");
         own.user = "U_ME".into();
@@ -1844,12 +1858,66 @@ mod tests {
 
         assert!(!app.sidebar.unread_channels.contains("C_OTHER"));
         assert!(!app.take_pending_terminal_bell());
-        // Sending implies read: the marker must advance so older
-        // foreign messages don't resurface, and newer ones still do.
         assert_eq!(
             app.last_seen_ts.get("C_OTHER").map(String::as_str),
             Some("2.0")
         );
+        let read_state = app.store.all_read_state().expect("read state");
+        assert_eq!(read_state.get("C_OTHER").map(String::as_str), Some("2.0"));
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_full_history_own_newest_message_does_not_advance_read_state() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C_CURRENT".into());
+        app.self_user_id = Some("U_ME".into());
+        app.latest_ts.insert("C_OTHER".into(), "1.0".into());
+        app.last_seen_ts.insert("C_OTHER".into(), "1.0".into());
+        app.store.mark_read("C_OTHER", "1.0").expect("seed read");
+
+        let mut own = msg("2.0");
+        own.user = "U_ME".into();
+        app.update(Action::MessagesLoaded {
+            channel_id: "C_OTHER".into(),
+            messages: vec![own],
+            is_background: false,
+        });
+
+        assert!(app.sidebar.unread_channels.contains("C_OTHER"));
+        assert!(!app.take_pending_terminal_bell());
+        assert_eq!(
+            app.last_seen_ts.get("C_OTHER").map(String::as_str),
+            Some("1.0")
+        );
+        let read_state = app.store.all_read_state().expect("read state");
+        assert_eq!(read_state.get("C_OTHER").map(String::as_str), Some("1.0"));
+    }
+
+    #[tokio::test]
+    async fn background_own_newest_message_does_not_advance_read_state() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C_CURRENT".into());
+        app.self_user_id = Some("U_ME".into());
+        app.latest_ts.insert("C_OTHER".into(), "1.0".into());
+        app.last_seen_ts.insert("C_OTHER".into(), "1.0".into());
+        app.store.mark_read("C_OTHER", "1.0").expect("seed read");
+
+        let mut own = msg("3.0");
+        own.user = "U_ME".into();
+        app.update(Action::MessagesLoaded {
+            channel_id: "C_OTHER".into(),
+            messages: vec![own],
+            is_background: true,
+        });
+
+        assert!(app.sidebar.unread_channels.contains("C_OTHER"));
+        assert!(!app.take_pending_terminal_bell());
+        assert_eq!(
+            app.last_seen_ts.get("C_OTHER").map(String::as_str),
+            Some("1.0")
+        );
+        let read_state = app.store.all_read_state().expect("read state");
+        assert_eq!(read_state.get("C_OTHER").map(String::as_str), Some("1.0"));
     }
 
     #[tokio::test]

@@ -282,7 +282,7 @@ impl SlackClient {
         channel_id: &str,
         text: &str,
         thread_ts: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut body = serde_json::json!({
             "channel": channel_id,
             "text": text,
@@ -291,8 +291,8 @@ impl SlackClient {
             body["thread_ts"] = serde_json::Value::String(ts.to_string());
         }
 
-        let _data: PostMessageData = self.post("chat.postMessage", &body).await?;
-        Ok(())
+        let data: PostMessageData = self.post("chat.postMessage", &body).await?;
+        Ok(data.ts)
     }
 
     pub async fn upload_file(
