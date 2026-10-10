@@ -4,12 +4,17 @@ use std::time::Instant;
 
 use color_eyre::eyre::{Report, Result, WrapErr};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use futures::FutureExt;
+use futures::future::{BoxFuture, OptionFuture};
 use ratatui::layout::Position;
 use tokio::sync::mpsc;
 
-use crate::action::{Action, ErrorContext};
+use crate::action::{Action, ErrorContext, ReactionTarget};
 use crate::components::input::TextInput;
+use crate::components::link_picker::LinkPicker;
 use crate::components::messages::MessageList;
+use crate::components::reaction_picker::ReactionPicker;
+use crate::components::reactions::ReactionsPopup;
 use crate::components::sidebar::ChannelSidebar;
 use crate::components::{Component, EventResult};
 use crate::config::Config;
@@ -62,6 +67,9 @@ const UPLOAD_USAGE: &str = "Usage: /upload <path> [comment]";
 /// failures still recover.
 const MAX_IMAGE_FETCH_ATTEMPTS: u32 = 3;
 
+/// How many messages back a channel load pulls from `conversations.history`.
+const HISTORY_LIMIT: u32 = 100;
+
 /// Progress of one `d`-key download batch.  Files finish (or fail)
 /// independently; a single shared status line would let a later
 /// "Saved" overwrite an earlier failure.
@@ -105,6 +113,13 @@ pub struct App {
     pub sidebar: ChannelSidebar,
     pub messages: MessageList,
     pub input: TextInput,
+    /// Who-reacted overlay for the selected message, when open.
+    pub reactions_popup: Option<ReactionsPopup>,
+    pub reaction_picker: Option<ReactionPicker>,
+    pub link_picker: Option<LinkPicker>,
+    /// The pending mutation is polled by the UI loop so its result is observed.
+    reaction_request: Option<BoxFuture<'static, Action>>,
+    browser_request: Option<BoxFuture<'static, Action>>,
 
     pub slack: SlackClient,
     pub current_channel_id: Option<String>,
@@ -115,7 +130,7 @@ pub struct App {
     last_poll: Instant,
     /// Newest message ts the user has seen per channel.
     last_seen_ts: HashMap<String, String>,
-    /// Newest message ts we know about per channel.
+    /// Newest known message ts, or "0" after a successful empty history.
     latest_ts: HashMap<String, String>,
     /// Index into channels list for background polling rotation.
     poll_rotation: usize,
@@ -140,6 +155,9 @@ pub struct App {
     in_flight_send_text: Option<String>,
     /// Progress of the current `d`-key download batch, if any.
     download_batch: Option<DownloadBatch>,
+    /// Lazily initialized system clipboard. Keeping the handle alive is
+    /// required by some clipboard backends after setting its contents.
+    clipboard: Option<arboard::Clipboard>,
     /// Whether the terminal reports modified keys (kitty keyboard
     /// protocol) — controls the Shift+Enter hint.
     pub keyboard_enhanced: bool,
@@ -154,14 +172,7 @@ pub struct App {
     /// channel title.
     closing_thread: bool,
     pending_terminal_bell: TerminalBell,
-    /// Per-channel cutoff timestamps captured at `MarkAllRead` time.
-    /// Messages at or before the cutoff are considered read; messages
-    /// after are genuinely new and should trigger unread.
-    mark_all_read_cutoffs: HashMap<String, String>,
-    /// Deferred unread removal: keeps the current channel visible in
-    /// the unread list until the user navigates away.
-    deferred_read_channel: Option<String>,
-
+    terminal_focused: bool,
     pub status_message: Option<String>,
     pub loading: bool,
     /// Why the current foreground load was initiated.
@@ -238,7 +249,7 @@ fn parse_upload_parts(input: &str) -> Result<(String, &str), String> {
 
 #[cfg(test)]
 mod upload_command_tests {
-    use super::{UPLOAD_USAGE, parse_upload_command};
+    use crate::app::{UPLOAD_USAGE, parse_upload_command};
 
     #[test]
     fn parse_upload_command_ignores_regular_messages() {
@@ -336,6 +347,11 @@ impl App {
             sidebar: ChannelSidebar::new(),
             messages: MessageList::new(),
             input: TextInput::new(),
+            reactions_popup: None,
+            reaction_picker: None,
+            link_picker: None,
+            reaction_request: None,
+            browser_request: None,
             slack,
             current_channel_id: None,
             action_tx,
@@ -353,13 +369,15 @@ impl App {
             thread_poll_in_flight: false,
             in_flight_send_text: None,
             download_batch: None,
+            clipboard: None,
             keyboard_enhanced: false,
             panes: crate::ui::Panes::default(),
             pending_thread: None,
             closing_thread: false,
             pending_terminal_bell: TerminalBell::Idle,
-            mark_all_read_cutoffs: HashMap::new(),
-            deferred_read_channel: None,
+            // An app may start in an inactive tab. Wait for a focus report
+            // or user input before suppressing current-channel alerts.
+            terminal_focused: false,
             status_message: Some("Loading channels...".into()),
             loading: true,
             load_reason: LoadReason::ChannelOpen,
@@ -372,6 +390,7 @@ impl App {
         tui: &mut Tui,
         action_rx: mpsc::UnboundedReceiver<Action>,
     ) -> Result<()> {
+        tui.enable_focus_reporting()?;
         let mut events = EventHandler::new(self.config.tick_rate(), action_rx);
         self.keyboard_enhanced = tui.keyboard_enhanced();
 
@@ -383,12 +402,34 @@ impl App {
         loop {
             tui.draw(|frame| ui::render(frame, self))?;
 
-            let action = match events.next().await? {
+            let event = tokio::select! {
+                event = events.next() => event?,
+                Some(action) = OptionFuture::from(self.reaction_request.as_mut()) => {
+                    self.reaction_request = None;
+                    AppEvent::BackgroundAction(action)
+                }
+                Some(action) = OptionFuture::from(self.browser_request.as_mut()) => {
+                    self.browser_request = None;
+                    AppEvent::BackgroundAction(action)
+                }
+            };
+            if matches!(
+                &event,
+                AppEvent::Key(_) | AppEvent::Mouse(_) | AppEvent::Paste(_) | AppEvent::Focus(true)
+            ) {
+                self.terminal_focused = true;
+                tui.acknowledge_notification()?;
+            }
+            let action = match event {
                 AppEvent::Tick => Action::Tick,
                 AppEvent::Resize => Action::Render,
                 AppEvent::Key(key) => self.handle_key(key),
                 AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
                 AppEvent::Paste(text) => self.handle_paste(&text),
+                AppEvent::Focus(focused) => {
+                    self.terminal_focused = focused;
+                    Action::Render
+                }
                 AppEvent::BackgroundAction(action) => action,
             };
 
@@ -406,6 +447,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(picker) = self.link_picker.as_mut() {
+            return picker.handle_key(key);
+        }
+        if let Some(picker) = self.reaction_picker.as_mut() {
+            return picker.handle_key(key);
+        }
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Insert => self.handle_insert_key(key),
@@ -414,6 +461,21 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // The reactions popup is modal: keys it doesn't own are
+        // swallowed so Esc/q can't fall through to quit or
+        // close-thread underneath it.  Only the global quit chord
+        // pierces the overlay.
+        if let Some(popup) = self.reactions_popup.as_mut() {
+            return match popup.handle_key(key) {
+                EventResult::Action(action) => action,
+                EventResult::Consumed => Action::Tick,
+                EventResult::Ignored => match (key.code, ctrl) {
+                    (KeyCode::Char('c'), true) => Action::Quit,
+                    _ => Action::Tick,
+                },
+            };
+        }
 
         match (key.code, ctrl) {
             // Quit
@@ -460,6 +522,13 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) -> Action {
+        if self.link_picker.is_some() {
+            return Action::Render;
+        }
+        if let Some(picker) = self.reaction_picker.as_mut() {
+            picker.insert_text(text);
+            return Action::Render;
+        }
         if self.mode == Mode::Insert {
             self.input.insert_text(text);
         }
@@ -467,6 +536,41 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if let Some(picker) = self.link_picker.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => picker.move_selection(true),
+                MouseEventKind::ScrollDown => picker.move_selection(false),
+                _ => {}
+            }
+            return Action::Render;
+        }
+        if let Some(picker) = self.reaction_picker.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => picker.move_selection(true),
+                MouseEventKind::ScrollDown => picker.move_selection(false),
+                _ => {}
+            }
+            return Action::Render;
+        }
+        if let Some(popup) = self.reactions_popup.as_mut() {
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => Action::ToggleReactions,
+                MouseEventKind::ScrollUp => {
+                    popup.scroll_up();
+                    Action::Tick
+                }
+                MouseEventKind::ScrollDown => {
+                    popup.scroll_down();
+                    Action::Tick
+                }
+                MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::Moved
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight => Action::Tick,
+            };
+        }
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_left_click(position),
@@ -515,10 +619,26 @@ impl App {
         should_ring
     }
 
-    fn mark_unread_and_maybe_bell(&mut self, channel_id: &str, should_bell: bool) {
-        let newly_unread = self.sidebar.unread_channels.insert(channel_id.to_string());
-        if newly_unread && should_bell {
-            self.pending_terminal_bell = TerminalBell::Pending;
+    fn channel_has_unseen_messages(&self, channel_id: &str) -> bool {
+        self.latest_ts.get(channel_id).is_some_and(|latest| {
+            latest != "0"
+                && self
+                    .last_seen_ts
+                    .get(channel_id)
+                    .is_none_or(|seen| latest > seen)
+        })
+    }
+
+    fn update_channel_unread(&mut self, channel_id: &str) {
+        // Keep the open channel in its existing section until navigation
+        // away, so reading does not reshuffle the sidebar mid-session.
+        if self.current_channel_id.as_deref() == Some(channel_id) {
+            return;
+        }
+        if self.channel_has_unseen_messages(channel_id) {
+            self.sidebar.unread_channels.insert(channel_id.to_string());
+        } else {
+            self.sidebar.unread_channels.remove(channel_id);
         }
     }
 
@@ -535,21 +655,28 @@ impl App {
                 self.sidebar.filter_unread = !self.sidebar.filter_unread;
                 if self.sidebar.filter_unread {
                     self.sidebar.snap_selection_to_visible();
-                } else {
-                    self.flush_deferred_read();
                 }
             }
-            Action::OpenThread(ref thread_ts) => {
-                self.handle_open_thread(thread_ts);
+            Action::OpenThread(ref thread_ts) => self.handle_open_thread(thread_ts),
+            Action::CloseThread => self.handle_close_thread(),
+            Action::SendMessage => self.handle_send_message(),
+            Action::DownloadFiles => self.handle_download_files(),
+            Action::CopyMessage => self.handle_copy_message(),
+            Action::OpenMessageLink => self.handle_open_message_link(),
+            Action::CloseLinkPicker => self.link_picker = None,
+            Action::OpenUrl(url) => self.open_url(url),
+            Action::BrowserFinished(result) => {
+                self.status_message = Some(match result {
+                    Ok(()) => "Opened link in browser".into(),
+                    Err(error) => error,
+                });
             }
-            Action::CloseThread => {
-                self.handle_close_thread();
-            }
-            Action::SendMessage => {
-                self.handle_send_message();
-            }
-            Action::DownloadFiles => {
-                self.handle_download_files();
+            Action::ToggleReactions => self.handle_toggle_reactions(),
+            Action::OpenReactionPicker => self.handle_open_reaction_picker(),
+            Action::CloseReactionPicker => self.reaction_picker = None,
+            Action::SubmitReaction => self.handle_submit_reaction(),
+            Action::ReactionAdded { target, name } => {
+                self.handle_reaction_added(&target, &name);
             }
             Action::FileDownloaded { dest } => {
                 self.handle_download_finished(Ok(dest));
@@ -652,7 +779,7 @@ impl App {
                 self.status_message = Some(message);
                 self.loading = false;
             }
-            ErrorContext::Auth => {
+            ErrorContext::Auth | ErrorContext::Reaction => {
                 self.status_message = Some(message);
             }
         }
@@ -686,6 +813,175 @@ impl App {
         }
     }
 
+    fn handle_copy_message(&mut self) {
+        let Some(text) = self.messages.selected_message_text() else {
+            self.status_message = Some("No message selected".into());
+            return;
+        };
+        if text.is_empty() {
+            self.status_message = Some("Selected message has no text".into());
+            return;
+        }
+
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
+                Err(error) => {
+                    self.status_message = Some(format!("Failed to access clipboard: {error}"));
+                    return;
+                }
+            }
+        }
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+
+        self.status_message = Some(
+            match clipboard.set_text(crate::message_links::copy_text(text)) {
+                Ok(()) => "Copied message".into(),
+                Err(error) => format!("Failed to copy message: {error}"),
+            },
+        );
+    }
+
+    fn handle_open_message_link(&mut self) {
+        if self.browser_request.is_some() {
+            self.status_message = Some("Opening link...".into());
+            return;
+        }
+        let Some(text) = self.messages.selected_message_text() else {
+            self.status_message = Some("No message selected".into());
+            return;
+        };
+        let mut links = crate::message_links::links(text);
+        match links.len() {
+            0 => self.status_message = Some("Selected message has no web links".into()),
+            1 => {
+                if let Some(url) = links.pop() {
+                    self.open_url(url);
+                }
+            }
+            _ => {
+                self.link_picker = Some(LinkPicker::new(links));
+                self.status_message = None;
+            }
+        }
+    }
+
+    fn open_url(&mut self, url: reqwest::Url) {
+        if self.browser_request.is_some() {
+            return;
+        }
+        self.link_picker = None;
+        self.status_message = Some("Opening link...".into());
+        self.browser_request =
+            Some(async move { Action::BrowserFinished(crate::browser::open(url).await) }.boxed());
+    }
+
+    fn handle_open_reaction_picker(&mut self) {
+        if self.reaction_picker.is_some() {
+            return;
+        }
+        if self.reaction_request.is_some() {
+            self.status_message = Some("Adding reaction...".into());
+            return;
+        }
+        let (Some(channel_id), Some(message_ts)) = (
+            self.current_channel_id.clone(),
+            self.messages.selected_message_ts(),
+        ) else {
+            self.status_message = Some("No message selected".into());
+            return;
+        };
+        let target = ReactionTarget {
+            channel_id,
+            message_ts: message_ts.to_string(),
+        };
+        let names = self.custom_emoji_urls.keys().map(String::as_str).chain(
+            self.messages
+                .selected_message_reactions()
+                .iter()
+                .map(|reaction| reaction.name.as_str()),
+        );
+        self.reaction_picker = Some(ReactionPicker::new(target, names));
+        self.reactions_popup = None;
+        self.status_message = None;
+    }
+
+    fn handle_submit_reaction(&mut self) {
+        if self.reaction_request.is_some() {
+            return;
+        }
+        let Some(picker) = self.reaction_picker.as_ref() else {
+            return;
+        };
+        let Some(name) = picker.selected_name().map(str::to_string) else {
+            self.status_message = Some("Enter a Slack emoji name".into());
+            return;
+        };
+        let target = picker.target.clone();
+        let client = self.slack.clone();
+        self.status_message = Some(format!("Adding :{name}:..."));
+        self.reaction_picker = None;
+        self.reaction_request = Some(
+            async move {
+                match client
+                    .add_reaction(&target.channel_id, &target.message_ts, &name)
+                    .await
+                {
+                    Ok(()) => Action::ReactionAdded { target, name },
+                    Err(error) => Action::Error {
+                        context: ErrorContext::Reaction,
+                        message: format!("Failed to add :{name}: {error}"),
+                    },
+                }
+            }
+            .boxed(),
+        );
+    }
+
+    fn handle_reaction_added(&mut self, target: &ReactionTarget, name: &str) {
+        self.status_message = Some(format!("Added :{name}:"));
+        if self.current_channel_id.as_deref() != Some(target.channel_id.as_str()) || self.loading {
+            return;
+        }
+        if let Some(thread_ts) = self.messages.active_thread.as_deref() {
+            self.load_thread_replies_quiet(&target.channel_id, thread_ts);
+        } else {
+            self.load_messages_refresh(&target.channel_id);
+        }
+    }
+
+    fn handle_toggle_reactions(&mut self) {
+        if self.reactions_popup.take().is_some() {
+            return;
+        }
+        let reactions = self.messages.selected_message_reactions().to_vec();
+        if reactions.is_empty() {
+            self.status_message = Some("Selected message has no reactions".into());
+            return;
+        }
+
+        let popup = ReactionsPopup::new(reactions);
+        // Reactors may never have posted in the loaded history, so
+        // their names can be missing from the cache — resolve them now;
+        // the popup picks names up live as responses arrive.
+        let mut seen = HashSet::new();
+        let mut unresolved = Vec::new();
+        for user_id in popup.user_ids() {
+            push_unresolved_user_id(
+                user_id,
+                &self.messages.user_cache,
+                &mut seen,
+                &mut unresolved,
+            );
+        }
+        for user_id in unresolved {
+            self.resolve_user(user_id);
+        }
+        self.reactions_popup = Some(popup);
+    }
+
     fn handle_file_image_failed(&mut self, image_key: &str) {
         self.requested_file_images.remove(image_key);
         *self
@@ -694,13 +990,20 @@ impl App {
             .or_insert(0) += 1;
     }
 
-    fn mark_self_sent_message_read(&mut self, channel_id: &str, ts: &str) {
+    fn mark_channel_read(&mut self, channel_id: &str, ts: &str) {
+        if self
+            .last_seen_ts
+            .get(channel_id)
+            .is_some_and(|seen| seen.as_str() >= ts)
+        {
+            return;
+        }
         self.last_seen_ts
             .insert(channel_id.to_string(), ts.to_string());
-        self.mark_all_read_cutoffs.remove(channel_id);
         if let Err(e) = self.store.mark_read(channel_id, ts) {
             tracing::warn!("Failed to persist read state: {e}");
         }
+        self.update_channel_unread(channel_id);
     }
 
     fn handle_message_sent(
@@ -716,7 +1019,7 @@ impl App {
         if thread_ts.is_none()
             && let Some(ts) = message_ts
         {
-            self.mark_self_sent_message_read(channel_id, ts);
+            self.mark_channel_read(channel_id, ts);
         }
         // Quiet refreshes: the send already succeeded, and a loud
         // failure here would reset thread/channel state belonging to
@@ -725,12 +1028,6 @@ impl App {
             self.load_thread_replies_quiet(channel_id, ts);
         } else {
             self.load_messages_refresh(channel_id);
-        }
-    }
-
-    fn flush_deferred_read(&mut self) {
-        if let Some(ch) = self.deferred_read_channel.take() {
-            self.sidebar.unread_channels.remove(&ch);
         }
     }
 
@@ -746,8 +1043,9 @@ impl App {
         // is loading should not drop into thread mode later.
         let cancelled_thread_open = self.pending_thread.take().is_some();
         if self.current_channel_id.as_deref() != Some(&channel_id) {
-            self.flush_deferred_read();
-            self.current_channel_id = Some(channel_id.clone());
+            if let Some(previous) = self.current_channel_id.replace(channel_id.clone()) {
+                self.update_channel_unread(&previous);
+            }
             self.closing_thread = false;
             // Show the new channel name with an empty message list
             // immediately so stale content from the previous channel
@@ -771,33 +1069,24 @@ impl App {
 
     fn handle_mark_all_read(&mut self) {
         self.sidebar.mark_all_read();
-        self.deferred_read_channel = None;
         // Persist for channels with known timestamps — one transaction
         // so the event loop isn't stalled by a WAL sync per channel.
         for (ch_id, ts) in &self.latest_ts {
-            self.last_seen_ts.insert(ch_id.clone(), ts.clone());
+            let seen = self
+                .last_seen_ts
+                .entry(ch_id.clone())
+                .or_insert_with(|| ts.clone());
+            if ts > seen {
+                seen.clone_from(ts);
+            }
         }
-        let entries = self
-            .latest_ts
-            .iter()
-            .map(|(id, ts)| (id.as_str(), ts.as_str()));
+        let entries = self.latest_ts.keys().filter_map(|id| {
+            self.last_seen_ts
+                .get(id)
+                .map(|ts| (id.as_str(), ts.as_str()))
+        });
         if let Err(e) = self.store.mark_read_many(entries) {
             tracing::warn!("Failed to persist read state: {e}");
-        }
-        // For channels that haven't been hydrated yet, record a
-        // cutoff so that late background polls only suppress messages
-        // at or before what was known at mark-all-read time.
-        // Messages arriving *after* this cutoff will correctly
-        // trigger unread.  Channels with no known ts get "0" so any
-        // real message is considered new.
-        self.mark_all_read_cutoffs.clear();
-        for ch in &self.sidebar.channels {
-            let cutoff = self
-                .latest_ts
-                .get(&ch.id)
-                .cloned()
-                .unwrap_or_else(|| "0".to_string());
-            self.mark_all_read_cutoffs.insert(ch.id.clone(), cutoff);
         }
     }
 
@@ -811,7 +1100,16 @@ impl App {
         self.messages
             .user_cache
             .insert(user_id.clone(), display_name.to_string());
-        self.messages.invalidate_cache();
+        // Rebuild the visual lines only when this user is actually on
+        // screen — resolutions for reaction-popup users who never
+        // posted would otherwise force a full re-render each.
+        let referenced = self.messages.messages.iter().any(|message| {
+            message.sender_id() == user_id
+                || mentioned_user_ids(&message.text).contains(&user_id.as_str())
+        });
+        if referenced {
+            self.messages.invalidate_cache();
+        }
         self.sidebar.update_dm_name(&user_id, display_name);
 
         // If the active conversation is a DM with this user, update
@@ -972,10 +1270,6 @@ impl App {
         self.loading = false;
         self.status_message = None;
 
-        // Prune stale cutoff entries for channels no longer in the list.
-        self.mark_all_read_cutoffs
-            .retain(|id, _| self.sidebar.channels.iter().any(|c| c.id == *id));
-
         // Try to restore last session, otherwise select first channel
         self.restore_session();
         if self.current_channel_id.is_none()
@@ -1023,40 +1317,28 @@ impl App {
             .self_user_id
             .as_deref()
             .is_some_and(|self_id| messages.first().is_some_and(|m| m.sender_id() == self_id));
-        if let Some(ref ts) = newest_ts {
-            let prev = self.latest_ts.get(channel_id);
-            let had_session_baseline = prev.is_some();
-            let should_bell_for_newest = had_session_baseline && !newest_is_own;
-            let is_new = prev.is_none_or(|p| ts.as_str() > p.as_str());
-            if is_new {
-                self.latest_ts.insert(channel_id.to_string(), ts.clone());
-
-                if let Some(cutoff) = self.mark_all_read_cutoffs.get(channel_id) {
-                    // If MarkAllRead recorded a cutoff for this channel,
-                    // only suppress messages at or before that cutoff.
-                    // Messages genuinely newer than the cutoff trigger
-                    // unread.
-                    if ts.as_str() <= cutoff.as_str() {
-                        self.last_seen_ts.insert(channel_id.to_string(), ts.clone());
-                    } else {
-                        // Genuinely new — remove the cutoff and let
-                        // normal unread detection run.
-                        self.mark_all_read_cutoffs.remove(channel_id);
-                        let is_current = self.current_channel_id.as_deref() == Some(channel_id);
-                        if !is_current {
-                            self.mark_unread_and_maybe_bell(channel_id, should_bell_for_newest);
-                        }
-                    }
-                } else {
-                    let is_current = self.current_channel_id.as_deref() == Some(channel_id);
-                    let last_seen = self.last_seen_ts.get(channel_id);
-                    let unseen = last_seen.is_none_or(|s| ts.as_str() > s.as_str());
-                    if !is_current && unseen {
-                        self.mark_unread_and_maybe_bell(channel_id, should_bell_for_newest);
-                    }
-                }
-            }
+        // A successful empty response also establishes a baseline, so the
+        // first real message in an empty channel can trigger an alert.
+        let observed_ts = newest_ts.as_deref().unwrap_or("0");
+        let prev = self.latest_ts.get(channel_id);
+        let had_session_baseline = prev.is_some();
+        let is_new = prev.is_none_or(|p| observed_ts > p.as_str());
+        if is_new {
+            self.latest_ts
+                .insert(channel_id.to_string(), observed_ts.to_string());
         }
+        let viewing_channel = self.terminal_focused
+            && self.current_channel_id.as_deref() == Some(channel_id)
+            && self.messages.active_thread.is_none();
+        if is_new
+            && had_session_baseline
+            && !newest_is_own
+            && !viewing_channel
+            && self.channel_has_unseen_messages(channel_id)
+        {
+            self.pending_terminal_bell = TerminalBell::Pending;
+        }
+        self.update_channel_unread(channel_id);
 
         // Only update the visible message list for the current channel
         if self.current_channel_id.as_deref() != Some(channel_id) {
@@ -1078,18 +1360,7 @@ impl App {
             && self.load_reason == LoadReason::ChannelOpen
             && let Some(ts) = newest_ts
         {
-            let already_seen = self.last_seen_ts.get(channel_id).is_some_and(|s| s == &ts);
-            if !already_seen {
-                self.last_seen_ts.insert(channel_id.to_string(), ts.clone());
-                if let Err(e) = self.store.mark_read(channel_id, &ts) {
-                    tracing::warn!("Failed to persist read state: {e}");
-                }
-            }
-            if self.sidebar.filter_unread {
-                self.deferred_read_channel = Some(channel_id.to_string());
-            } else {
-                self.sidebar.unread_channels.remove(channel_id);
-            }
+            self.mark_channel_read(channel_id, &ts);
         }
 
         // If we were waiting for channel data after closing a thread,
@@ -1307,13 +1578,13 @@ impl App {
     }
 
     fn load_messages(&self, channel_id: &str) {
-        self.spawn_fetch_messages(channel_id, 50, false, false);
+        self.spawn_fetch_messages(channel_id, HISTORY_LIMIT, false, false);
     }
 
     /// Foreground refresh: updates the message list but swallows errors
     /// so transient poll failures don't flash in the status bar.
     fn load_messages_refresh(&self, channel_id: &str) {
-        self.spawn_fetch_messages(channel_id, 50, false, true);
+        self.spawn_fetch_messages(channel_id, HISTORY_LIMIT, false, true);
     }
 
     fn load_messages_background(&self, channel_id: &str) {
@@ -1649,7 +1920,7 @@ fn push_unresolved_user_id(
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::*;
+    use crate::app::*;
     use crate::slack::types::{Channel, SlackMessage};
 
     fn test_app() -> App {
@@ -1657,6 +1928,242 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let store = Store::open_in_memory().expect("test store");
         App::new(config, tx, None, store).expect("test app")
+    }
+
+    async fn reaction_test_server(
+        responses: Vec<String>,
+    ) -> (
+        SlackClient,
+        tokio::task::JoinHandle<Vec<(String, serde_json::Value)>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");
+        let address = listener.local_addr().expect("address");
+        let client = SlackClient::with_api_base(format!("http://{address}")).expect("client");
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                let mut requests = Vec::new();
+                for response in responses {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let mut stream = BufReader::new(stream);
+                    let mut request_line = String::new();
+                    stream.read_line(&mut request_line).await.expect("request line");
+                    let mut content_length = 0;
+                    let mut header_bytes = request_line.len();
+                    loop {
+                        let mut line = String::new();
+                        assert!(stream.read_line(&mut line).await.expect("header") > 0);
+                        header_bytes += line.len();
+                        assert!(header_bytes < 8192, "oversized request headers");
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = value.trim().parse::<usize>().expect("length");
+                        }
+                    }
+                    assert!(content_length <= 4096, "oversized request body");
+                    let mut body = vec![0; content_length];
+                    stream.read_exact(&mut body).await.expect("body");
+                    let body = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).expect("JSON body") };
+                    requests.push((request_line, body));
+                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
+                    stream.get_mut().write_all(reply.as_bytes()).await.expect("reply");
+                }
+                requests
+            }).await.expect("server timeout")
+        });
+        (client, server)
+    }
+
+    async fn next_reaction_result(app: &mut App) -> Action {
+        let request = app.reaction_request.take().expect("pending reaction");
+        tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("reaction timeout")
+    }
+
+    #[test]
+    fn reaction_picker_is_modal_and_requires_a_selected_message() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        let open = app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(matches!(open, Action::OpenReactionPicker));
+        app.update(open);
+        assert!(app.reaction_picker.is_none());
+        assert_eq!(app.status_message.as_deref(), Some("No message selected"));
+
+        app.current_channel_id = Some("C1".into());
+        app.messages.set_channel(vec![msg("1.0")], "general".into());
+        app.input.insert_text("draft");
+        app.update(Action::OpenReactionPicker);
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.update(action);
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.reaction_picker
+                .as_ref()
+                .and_then(ReactionPicker::selected_name),
+            Some("q")
+        );
+        assert_eq!(app.input.get_text(), "draft");
+        let close = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(close);
+        assert!(app.reaction_picker.is_none());
+        assert!(app.reaction_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn reactions_add_exact_message_and_refresh_channel_or_thread() {
+        for in_thread in [false, true] {
+            let expected_ts = if in_thread { "200.2" } else { "100.1" };
+            let refreshed = serde_json::json!({"ok": true, "messages": [{
+                "ts": expected_ts, "user": "U1", "text": "hello",
+                "reactions": [{"name": "team_party", "count": 1, "users": ["U1"]}]
+            }]});
+            let (client, server) = reaction_test_server(vec![
+                serde_json::json!({"ok": true}).to_string(),
+                refreshed.to_string(),
+            ])
+            .await;
+            let mut app = test_app();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            app.action_tx = tx;
+            app.slack = client;
+            app.current_channel_id = Some("C1".into());
+            app.loading = false;
+            app.messages.user_cache.insert("U1".into(), "me".into());
+            if in_thread {
+                let mut reply = msg("200.2");
+                reply.thread_ts = Some("100.1".into());
+                app.messages
+                    .set_thread("100.1".into(), vec![msg("100.1"), reply]);
+                app.messages.selected_message = 1;
+            } else {
+                app.messages
+                    .set_channel(vec![msg("200.2"), msg("100.1")], "general".into());
+                app.messages.selected_message = 0;
+            }
+            app.update(Action::OpenReactionPicker);
+            app.handle_paste(":team_party:");
+            // A poll/selection change after opening must not retarget the write.
+            app.messages.selected_message = usize::from(!in_thread);
+            app.update(Action::SubmitReaction);
+            app.update(Action::SubmitReaction);
+            app.update(Action::OpenReactionPicker);
+            assert!(app.reaction_picker.is_none());
+            assert!(app.reaction_request.is_some());
+
+            let result = next_reaction_result(&mut app).await;
+            assert!(matches!(&result, Action::ReactionAdded { target, name }
+                if target.channel_id == "C1" && target.message_ts == expected_ts && name == "team_party"));
+            app.update(result);
+            let refresh = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("refresh timeout")
+                .expect("refresh action");
+            app.update(refresh);
+            assert!(app.messages.messages.iter().any(|message| {
+                message.ts == expected_ts
+                    && message
+                        .reactions
+                        .iter()
+                        .any(|reaction| reaction.name == "team_party")
+            }));
+            assert_eq!(app.status_message.as_deref(), Some("Added :team_party:"));
+
+            let requests = server.await.expect("server task");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].0.trim(), "POST /reactions.add HTTP/1.1");
+            assert_eq!(
+                requests[0].1,
+                serde_json::json!({"channel": "C1", "timestamp": expected_ts, "name": "team_party"})
+            );
+            let path = requests[1]
+                .0
+                .split_whitespace()
+                .nth(1)
+                .expect("request path");
+            let url = reqwest::Url::parse(&format!("http://localhost{path}")).expect("refresh URL");
+            assert_eq!(
+                url.path(),
+                if in_thread {
+                    "/conversations.replies"
+                } else {
+                    "/conversations.history"
+                }
+            );
+            assert!(
+                url.query_pairs()
+                    .any(|(key, value)| key == "channel" && value == "C1")
+            );
+            if in_thread {
+                assert!(
+                    url.query_pairs()
+                        .any(|(key, value)| key == "ts" && value == "100.1")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_failure_is_reported_and_does_not_reset_other_operations() {
+        for error in ["already_reacted", "missing_scope"] {
+            let (client, server) = reaction_test_server(vec![
+                serde_json::json!({"ok": false, "error": error}).to_string(),
+            ])
+            .await;
+            let mut app = test_app();
+            app.slack = client;
+            app.current_channel_id = Some("C1".into());
+            app.messages.set_channel(vec![msg("1.0")], "general".into());
+            app.pending_sends = 1;
+            app.pending_thread = Some("other_thread".into());
+            app.input.insert_text("unsent draft");
+            app.update(Action::OpenReactionPicker);
+            app.handle_paste("thumbsup::skin-tone-4");
+            app.update(Action::SubmitReaction);
+            let result = next_reaction_result(&mut app).await;
+            assert!(
+                matches!(&result, Action::Error { context: ErrorContext::Reaction, message } if message.contains(error))
+            );
+            app.update(result);
+            assert_eq!(app.pending_sends, 1);
+            assert_eq!(app.pending_thread.as_deref(), Some("other_thread"));
+            assert_eq!(app.input.get_text(), "unsent draft");
+            assert!(app.reaction_request.is_none());
+            app.update(Action::OpenReactionPicker);
+            assert!(app.reaction_picker.is_some());
+            assert_eq!(server.await.expect("server task").len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_completion_does_not_replace_another_channel() {
+        let (client, server) =
+            reaction_test_server(vec![serde_json::json!({"ok": true}).to_string()]).await;
+        let mut app = test_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.action_tx = tx;
+        app.slack = client;
+        app.current_channel_id = Some("C1".into());
+        app.messages.set_channel(vec![msg("1.0")], "general".into());
+        app.update(Action::OpenReactionPicker);
+        app.handle_paste("eyes");
+        app.update(Action::SubmitReaction);
+        app.current_channel_id = Some("C2".into());
+        app.messages.set_channel(vec![msg("9.0")], "random".into());
+        let result = next_reaction_result(&mut app).await;
+        app.update(result);
+        assert_eq!(app.messages.selected_message_ts(), Some("9.0"));
+        assert!(rx.try_recv().is_err());
+        let requests = server.await.expect("server task");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1["channel"], "C1");
     }
 
     #[test]
@@ -1846,7 +2353,7 @@ mod tests {
         app.self_user_id = Some("U_ME".into());
         // Baseline so a newer ts would normally trigger unread + bell.
         app.latest_ts.insert("C_OTHER".into(), "1.0".into());
-        app.mark_self_sent_message_read("C_OTHER", "2.0");
+        app.mark_channel_read("C_OTHER", "2.0");
 
         let mut own = msg("2.0");
         own.user = "U_ME".into();
@@ -1935,6 +2442,55 @@ mod tests {
 
         assert!(app.sidebar.unread_channels.contains("C_OTHER"));
         assert!(app.take_pending_terminal_bell());
+    }
+
+    #[test]
+    fn chat_notifications_skip_history_and_repeat_only_for_new_messages() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C_CURRENT".into());
+        for (ts, expected) in [("1.0", false), ("2.0", true), ("2.0", false), ("3.0", true)] {
+            app.update(Action::MessagesLoaded {
+                channel_id: "C_OTHER".into(),
+                messages: vec![msg(ts)],
+                is_background: true,
+            });
+            assert_eq!(app.take_pending_terminal_bell(), expected, "timestamp {ts}");
+        }
+    }
+
+    #[test]
+    fn first_message_after_empty_history_notifies() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C_CURRENT".into());
+        app.update(Action::MessagesLoaded {
+            channel_id: "C_OTHER".into(),
+            messages: Vec::new(),
+            is_background: true,
+        });
+        assert!(!app.sidebar.unread_channels.contains("C_OTHER"));
+        assert!(!app.take_pending_terminal_bell());
+        app.update(Action::MessagesLoaded {
+            channel_id: "C_OTHER".into(),
+            messages: vec![msg("1.0")],
+            is_background: true,
+        });
+        assert!(app.take_pending_terminal_bell());
+    }
+
+    #[test]
+    fn current_channel_notifies_when_terminal_loses_focus() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C1".into());
+        app.latest_ts.insert("C1".into(), "1.0".into());
+        for (ts, focused) in [("2.0", true), ("3.0", false)] {
+            app.terminal_focused = focused;
+            app.update(Action::MessagesLoaded {
+                channel_id: "C1".into(),
+                messages: vec![msg(ts)],
+                is_background: true,
+            });
+            assert_eq!(app.take_pending_terminal_bell(), !focused);
+        }
     }
 
     #[test]
@@ -2157,7 +2713,6 @@ mod tests {
 
         // C1 should still be visible (deferred) while viewing it
         assert!(app.sidebar.unread_channels.contains("C1"));
-        assert_eq!(app.deferred_read_channel.as_deref(), Some("C1"));
 
         // Navigate to C2
         app.sidebar.selected = 1;
@@ -2169,21 +2724,101 @@ mod tests {
         assert!(app.sidebar.unread_channels.contains("C2"));
     }
 
+    #[tokio::test]
+    async fn leaving_channel_retains_unread_messages_after_its_read_marker() {
+        let mut app = test_app();
+        app.terminal_focused = true;
+        app.sidebar.set_channels(two_channels());
+        app.messages.user_cache.insert("U1".into(), "Alice".into());
+        app.current_channel_id = Some("C1".into());
+        app.loading = true;
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("100.000001")],
+            is_background: false,
+        });
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("100.000002")],
+            is_background: false,
+        });
+
+        app.sidebar.selected = 1;
+        app.update(Action::OpenChannel);
+        assert!(app.sidebar.unread_channels.contains("C1"));
+
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("100.000002")],
+            is_background: true,
+        });
+        assert!(app.sidebar.unread_channels.contains("C1"));
+        assert!(!app.take_pending_terminal_bell());
+        assert_eq!(
+            app.last_seen_ts.get("C1").map(String::as_str),
+            Some("100.000001")
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_unloaded_channel_restores_known_unread_messages() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        app.current_channel_id = Some("C1".into());
+        app.loading = true;
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("100.000002")],
+            is_background: true,
+        });
+
+        app.sidebar.selected = 1;
+        app.update(Action::OpenChannel);
+
+        assert!(app.sidebar.unread_channels.contains("C1"));
+        assert!(!app.take_pending_terminal_bell());
+    }
+
     #[test]
-    fn toggle_unread_filter_off_flushes_deferred() {
+    fn mark_all_read_does_not_regress_a_confirmed_send() {
+        let mut app = test_app();
+        app.sidebar.set_channels(two_channels());
+        app.current_channel_id = Some("C2".into());
+        app.latest_ts.insert("C1".into(), "100.000001".into());
+        app.mark_channel_read("C1", "100.000003");
+
+        app.update(Action::MarkAllRead);
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("100.000002")],
+            is_background: true,
+        });
+
+        assert!(!app.sidebar.unread_channels.contains("C1"));
+        assert_eq!(
+            app.store
+                .all_read_state()
+                .expect("read state")
+                .get("C1")
+                .map(String::as_str),
+            Some("100.000003")
+        );
+    }
+
+    #[test]
+    fn toggle_unread_filter_off_keeps_deferred_read() {
         let mut app = test_app();
         app.sidebar.set_channels(two_channels());
         app.sidebar.unread_channels.insert("C1".into());
         app.sidebar.filter_unread = true;
         app.current_channel_id = Some("C1".into());
-        app.deferred_read_channel = Some("C1".into());
 
-        // Toggle filter OFF
+        // Toggle filter OFF — the open channel stays in the sidebar's
+        // Unread section until the user navigates away.
         app.update(Action::ToggleUnreadFilter);
 
         assert!(!app.sidebar.filter_unread);
-        assert!(!app.sidebar.unread_channels.contains("C1"));
-        assert!(app.deferred_read_channel.is_none());
+        assert!(app.sidebar.unread_channels.contains("C1"));
     }
 
     #[test]
@@ -2202,6 +2837,74 @@ mod tests {
     }
 
     #[test]
+    fn toggle_reactions_without_reactions_sets_status() {
+        let mut app = test_app();
+        app.messages.refresh_messages(vec![msg("1.0")]);
+
+        app.update(Action::ToggleReactions);
+
+        assert!(app.reactions_popup.is_none());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Selected message has no reactions")
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_reactions_opens_then_closes_popup() {
+        use crate::slack::types::Reaction;
+
+        let mut app = test_app();
+        let mut message = msg("1.0");
+        message.reactions.push(Reaction {
+            name: "thumbsup".into(),
+            count: 2,
+            users: vec!["U2".into(), "U3".into()],
+        });
+        app.messages.refresh_messages(vec![message]);
+
+        app.update(Action::ToggleReactions);
+        assert!(app.reactions_popup.is_some());
+        // Reactor names get resolution requests issued.
+        assert!(app.requested_users.contains("U2"));
+        assert!(app.requested_users.contains("U3"));
+
+        app.update(Action::ToggleReactions);
+        assert!(app.reactions_popup.is_none());
+    }
+
+    #[test]
+    fn popup_captures_keys_and_closes_without_quitting() {
+        use crate::components::reactions::ReactionsPopup;
+        use crate::slack::types::Reaction;
+
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        app.reactions_popup = Some(ReactionsPopup::new(vec![Reaction {
+            name: "tada".into(),
+            count: 1,
+            users: vec!["U2".into()],
+        }]));
+
+        // 'q' closes the popup instead of quitting the app.
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(action, Action::ToggleReactions));
+        app.update(action);
+        assert!(!app.should_quit);
+        assert!(app.reactions_popup.is_none());
+    }
+
+    #[test]
+    fn reactions_key_in_messages_panel_requests_toggle() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::ToggleReactions));
+    }
+
+    #[test]
     fn download_files_without_files_sets_status() {
         let mut app = test_app();
         app.messages.refresh_messages(vec![msg("1.0")]);
@@ -2212,6 +2915,71 @@ mod tests {
             app.status_message.as_deref(),
             Some("Selected message has no files")
         );
+    }
+
+    #[test]
+    fn copy_without_selected_message_sets_status() {
+        let mut app = test_app();
+
+        app.update(Action::CopyMessage);
+
+        assert_eq!(app.status_message.as_deref(), Some("No message selected"));
+    }
+
+    #[test]
+    fn copy_message_without_text_sets_status() {
+        let mut app = test_app();
+        let mut message = msg("1.0");
+        message.text.clear();
+        app.messages.refresh_messages(vec![message]);
+
+        app.update(Action::CopyMessage);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Selected message has no text")
+        );
+    }
+
+    #[test]
+    fn open_link_key_uses_message_focus_and_handles_missing_links() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(action, Action::OpenMessageLink));
+        app.update(action);
+        assert_eq!(app.status_message.as_deref(), Some("No message selected"));
+
+        app.messages.refresh_messages(vec![msg("1.0")]);
+        app.update(Action::OpenMessageLink);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Selected message has no web links")
+        );
+        assert!(app.browser_request.is_none());
+    }
+
+    #[test]
+    fn link_picker_keeps_destinations_stable_across_message_refreshes() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        let mut message = msg("1.0");
+        message.text = "<https://example.com/first|one> <https://example.com/second|two>".into();
+        app.messages.set_thread("1.0".into(), vec![message]);
+        app.update(Action::OpenMessageLink);
+        assert!(app.link_picker.is_some());
+
+        app.messages.refresh_messages(vec![msg("2.0")]);
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.update(action);
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&action, Action::OpenUrl(url) if url.as_str() == "https://example.com/second")
+        );
+        app.update(action);
+        assert!(app.link_picker.is_none());
+        // Constructing the request does not launch a browser until the UI polls it.
+        assert!(app.browser_request.is_some());
     }
 
     #[tokio::test]

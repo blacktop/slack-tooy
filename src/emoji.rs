@@ -13,7 +13,17 @@ pub fn lookup(name: &str) -> Option<&'static str> {
     EMOJI_MAP
         .binary_search_by_key(&base, |&(k, _)| k)
         .ok()
-        .map(|i| EMOJI_MAP[i].1)
+        .and_then(|i| EMOJI_MAP.get(i).map(|(_, glyph)| *glyph))
+}
+
+pub fn names() -> impl Iterator<Item = &'static str> {
+    EMOJI_MAP.iter().map(|(name, _)| *name)
+}
+
+pub fn name_for_unicode(glyph: &str) -> Option<&'static str> {
+    EMOJI_MAP
+        .iter()
+        .find_map(|(name, value)| (*value == glyph).then_some(*name))
 }
 
 /// Sorted by name for binary search.
@@ -210,7 +220,7 @@ static EMOJI_MAP: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{EMOJI_MAP, lookup};
+    use crate::emoji::{EMOJI_MAP, lookup};
 
     /// `lookup` binary-searches, which silently returns None for any
     /// entry that is out of order — enforce the precondition.

@@ -12,6 +12,7 @@ pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
+    Focus(bool),
     Resize,
     BackgroundAction(Action),
 }
@@ -57,7 +58,9 @@ impl EventHandler {
                         Event::Resize(_, _) => {
                             return Ok(AppEvent::Resize);
                         }
-                        Event::Key(_) | Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {}
+                        Event::FocusGained => return Ok(AppEvent::Focus(true)),
+                        Event::FocusLost => return Ok(AppEvent::Focus(false)),
+                        Event::Key(_) | Event::Mouse(_) => {}
                     }
                 }
                 Some(action) = self.action_rx.recv() => {

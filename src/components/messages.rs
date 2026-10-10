@@ -3,20 +3,20 @@ use std::collections::{HashMap, VecDeque};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::Action;
+use crate::components::markdown::render_markdown;
 use crate::components::{Component, EventResult};
 use crate::emoji;
 use crate::slack::types::{Reaction, SlackFile, SlackMessage, replace_user_mentions};
+use crate::theme;
 
 const AVATAR_WIDTH: u16 = 4;
 const IMAGE_PREVIEW_HEIGHT: u16 = 8;
@@ -24,9 +24,6 @@ const IMAGE_PREVIEW_WIDTH: u16 = 56;
 /// Right-side padding inside the messages panel (matches the 1-column
 /// gap the left border already provides).
 const MSG_RIGHT_PAD: u16 = 1;
-
-/// Subtle background for the selected message highlight.
-const SELECTED_MSG_BG: Color = Color::Rgb(40, 40, 50);
 
 /// Cap on cached decoded image previews — each holds a decoded RGB
 /// buffer (several MB for a 1024px thumb), so an unbounded cache grows
@@ -264,15 +261,21 @@ impl MessageList {
             // display is reversed: display 0 = last storage element
             self.messages
                 .len()
-                .checked_sub(self.selected_message + 1)
+                .checked_sub(self.selected_message.checked_add(1)?)
                 .and_then(|idx| self.messages.get(idx))
         }
+    }
+
+    /// Exact timestamp of the selected message, including a thread reply.
+    pub fn selected_message_ts(&self) -> Option<&str> {
+        self.selected_display_message()
+            .map(|message| message.ts.as_str())
     }
 
     /// Get the `thread_ts` for the currently selected message.
     pub fn selected_message_thread_ts(&self) -> Option<&str> {
         let msg = self.selected_display_message()?;
-        if msg.reply_count.unwrap_or(0) > 0 {
+        if msg.reply_count.is_some_and(|count| count > 0) {
             Some(msg.ts.as_str())
         } else {
             msg.thread_ts.as_deref()
@@ -283,6 +286,19 @@ impl MessageList {
     pub fn selected_message_files(&self) -> &[SlackFile] {
         self.selected_display_message()
             .map_or(&[][..], |msg| msg.files.as_slice())
+    }
+
+    /// Reactions on the currently selected message.
+    pub fn selected_message_reactions(&self) -> &[Reaction] {
+        self.selected_display_message()
+            .map_or(&[][..], |msg| msg.reactions.as_slice())
+    }
+
+    /// Original text of the selected message, before mention replacement,
+    /// Markdown rendering, or visual wrapping.
+    pub fn selected_message_text(&self) -> Option<&str> {
+        self.selected_display_message()
+            .map(|message| message.text.as_str())
     }
 
     fn get_or_build_lines(&mut self, text_width: usize) -> &[VisualLine] {
@@ -344,10 +360,7 @@ impl MessageList {
                 }
 
                 lines.push(VisualLine::header(
-                    Line::from(vec![
-                        Span::from(format!("[{ts}] ")).dim(),
-                        Span::from(display_name.to_string()).bold().cyan(),
-                    ]),
+                    message_header_line(&ts, display_name),
                     sender.to_string(),
                     i,
                 ));
@@ -358,8 +371,8 @@ impl MessageList {
                 let rendered_text = replace_user_mentions(&msg.text, |user_id| {
                     self.user_cache.get(user_id).cloned()
                 });
-                for wrapped in wrap_text(&rendered_text, text_width) {
-                    lines.push(VisualLine::text(Line::from(Span::from(wrapped)), i));
+                for line in render_markdown(&rendered_text, text_width) {
+                    lines.push(VisualLine::text(line, i));
                 }
             }
 
@@ -373,10 +386,7 @@ impl MessageList {
                     format!("[{kind}] {name} ({size})")
                 };
                 for wrapped in wrap_text(&label, text_width) {
-                    lines.push(VisualLine::text(
-                        Line::from(Span::from(wrapped).fg(Color::Rgb(130, 170, 210))),
-                        i,
-                    ));
+                    lines.push(VisualLine::text(accent_line(wrapped), i));
                 }
 
                 if let Some(image_key) = ready_image_key(file, &self.file_image_protocols) {
@@ -397,15 +407,7 @@ impl MessageList {
                 && let Some(count) = msg.reply_count
                 && count > 0
             {
-                let label = if count == 1 {
-                    "\u{21B3} 1 reply".to_string()
-                } else {
-                    format!("\u{21B3} {count} replies")
-                };
-                lines.push(VisualLine::text(
-                    Line::from(Span::from(label).fg(Color::Blue)),
-                    i,
-                ));
+                lines.push(VisualLine::text(thread_reply_line(count), i));
             }
         }
 
@@ -481,6 +483,29 @@ impl VisualLine {
     }
 }
 
+fn message_header_line(ts: &str, display_name: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{ts} "), theme::muted()),
+        Span::styled(
+            display_name.to_string(),
+            Style::default().fg(theme::BLUE).bold(),
+        ),
+    ])
+}
+
+fn accent_line(text: String) -> Line<'static> {
+    Line::from(Span::styled(text, Style::default().fg(theme::BLUE)))
+}
+
+fn thread_reply_line(count: u32) -> Line<'static> {
+    let label = if count == 1 {
+        "thread: 1 reply".to_string()
+    } else {
+        format!("thread: {count} replies")
+    };
+    accent_line(label)
+}
+
 impl Component for MessageList {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -532,6 +557,15 @@ impl Component for MessageList {
             // -- Download files on the selected message --
             (KeyCode::Char('d'), false) => EventResult::Action(Action::DownloadFiles),
 
+            // -- Copy the selected message text --
+            (KeyCode::Char('c'), false) => EventResult::Action(Action::CopyMessage),
+
+            (KeyCode::Char('o'), false) => EventResult::Action(Action::OpenMessageLink),
+
+            // -- Show who reacted to the selected message --
+            (KeyCode::Char('r'), false) => EventResult::Action(Action::ToggleReactions),
+            (KeyCode::Char('R' | '+'), false) => EventResult::Action(Action::OpenReactionPicker),
+
             // -- Thread: enter with l / → / Enter --
             (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, false) => {
                 if let Some(ts) = self.selected_message_thread_ts().map(String::from) {
@@ -554,29 +588,36 @@ impl Component for MessageList {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            Style::default().cyan()
-        } else {
-            Style::default().dim()
-        };
-
         let title = if self.active_thread.is_some() {
-            format!("Thread in #{}", self.channel_name)
+            Line::from(vec![
+                Span::styled(" thread ", Style::default().fg(theme::BLUE).bold()),
+                Span::styled(format!("#{}", self.channel_name), theme::muted()),
+            ])
         } else if self.channel_name.is_empty() {
-            String::new()
+            Line::from(Span::styled(" history ", theme::muted()))
         } else {
-            format!("#{}", self.channel_name)
+            Line::from(Span::styled(
+                format!(" #{} ", self.channel_name),
+                Style::default().fg(theme::TEXT).bold(),
+            ))
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(title.bold().cyan());
+        let block = theme::panel_block(title, focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.last_inner = inner;
 
         if self.messages.is_empty() {
+            let empty = if self.channel_name.is_empty() {
+                "Select a channel from the navigation pane."
+            } else {
+                "No messages loaded yet."
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(empty, theme::muted())))
+                    .style(theme::surface()),
+                inner,
+            );
             return;
         }
 
@@ -624,6 +665,7 @@ impl Component for MessageList {
         // Render visible lines (need split borrow: cache vs avatar_protocols)
         let cached = self.line_cache.as_ref();
         let lines = cached.map_or(&[][..], |(_, v)| v.as_slice());
+        let mut image_previews = Vec::new();
 
         for (i, vline) in lines[start..end].iter().enumerate() {
             #[expect(
@@ -637,6 +679,9 @@ impl Component for MessageList {
 
             let is_selected = vline.msg_index == selected;
             let row = Rect::new(inner.x, y, content_width, 1);
+            // Half-block images encode their lower pixels in the background
+            // color, so paint selection before rendering any image cells.
+            fill_selected_row_background(frame, inner, y, is_selected);
 
             let image_area = if show_avatars {
                 let [avatar_area, text_area] =
@@ -657,13 +702,15 @@ impl Component for MessageList {
                 image_preview_area(row, inner)
             };
 
-            fill_selected_row_background(frame, inner, y, is_selected);
-            render_file_image_preview(
-                frame,
-                image_area,
-                vline.image_key.as_deref(),
-                &mut self.file_image_protocols,
-            );
+            if let (Some(area), Some(key)) = (image_area, vline.image_key.as_deref()) {
+                image_previews.push((area, key));
+            }
+        }
+
+        // Paint multi-row previews after all text and selection backgrounds;
+        // later continuation rows must not overwrite earlier image pixels.
+        for (area, key) in image_previews {
+            render_file_image_preview(frame, area, key, &mut self.file_image_protocols);
         }
 
         render_scrollbar(frame, area, total, visible_rows, offset);
@@ -673,7 +720,7 @@ impl Component for MessageList {
 fn render_visual_line_text(frame: &mut Frame, area: Rect, line: &Line<'static>, is_selected: bool) {
     let mut paragraph = Paragraph::new(line.clone());
     if is_selected {
-        paragraph = paragraph.style(Style::default().bg(SELECTED_MSG_BG));
+        paragraph = paragraph.style(theme::selected());
     }
     frame.render_widget(paragraph, area);
 }
@@ -703,20 +750,17 @@ fn fill_selected_row_background(frame: &mut Frame, inner: Rect, y: u16, is_selec
     let buf = frame.buffer_mut();
     for x in row.left()..row.right() {
         if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_bg(SELECTED_MSG_BG);
+            cell.set_bg(theme::SELECTED);
         }
     }
 }
 
 fn render_file_image_preview(
     frame: &mut Frame,
-    area: Option<Rect>,
-    image_key: Option<&str>,
+    area: Rect,
+    image_key: &str,
     image_protocols: &mut HashMap<String, StatefulProtocol>,
 ) {
-    let (Some(area), Some(image_key)) = (area, image_key) else {
-        return;
-    };
     let Some(protocol) = image_protocols.get_mut(image_key) else {
         return;
     };
@@ -765,7 +809,7 @@ fn image_preview_area(row: Rect, bounds: Rect) -> Option<Rect> {
 /// characters are measured correctly.  Words longer than `width` are
 /// broken at character boundaries.  Leading indentation and
 /// consecutive spaces are preserved.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
@@ -828,7 +872,7 @@ fn wrap_paragraph(text: &str, width: usize, out: &mut Vec<String>) {
 
 /// Split a string into alternating runs of whitespace and
 /// non-whitespace, preserving the original characters.
-fn split_segments(s: &str) -> Vec<&str> {
+pub(crate) fn split_segments(s: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut chars = s.char_indices().peekable();
     while let Some(&(start, ch)) = chars.peek() {
@@ -850,7 +894,7 @@ fn split_segments(s: &str) -> Vec<&str> {
 /// columns plus the remaining suffix.  If the first character is
 /// already wider than `width`, it is returned as a one-character
 /// prefix so progress is always made.
-fn split_to_width(text: &str, width: usize) -> (&str, &str, usize) {
+pub(crate) fn split_to_width(text: &str, width: usize) -> (&str, &str, usize) {
     let mut end = 0;
     let mut used_width = 0;
 
@@ -879,7 +923,10 @@ fn unread_separator_line(unread_count: usize, width: usize) -> Line<'static> {
     let label_width = UnicodeWidthStr::width(label);
 
     if width <= label_width {
-        return Line::from(Span::from(label.to_string()).fg(Color::Red));
+        return Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(theme::RED),
+        ));
     }
 
     let dash_count = width - label_width;
@@ -887,7 +934,7 @@ fn unread_separator_line(unread_count: usize, width: usize) -> Line<'static> {
     let right = dash_count - left;
     let text = format!("{}{}{}", "-".repeat(left), label, "-".repeat(right));
 
-    Line::from(Span::from(text).fg(Color::Red))
+    Line::from(Span::styled(text, Style::default().fg(theme::RED)))
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -924,8 +971,7 @@ fn format_slack_ts(ts: &str) -> String {
         )
 }
 
-/// Render reactions, wrapping to multiple lines if needed:
-/// 👍 3  🔥 1  :custom: 2
+/// Render reactions, wrapping to multiple lines if needed.
 fn format_reactions(
     reactions: &[Reaction],
     custom_urls: &HashMap<String, String>,
@@ -955,12 +1001,10 @@ fn format_reactions(
             current_width += 2;
         }
 
-        let span = if unicode.is_some() {
-            Span::from(label).dim()
-        } else if custom_urls.contains_key(&r.name) {
-            Span::from(label).fg(ratatui::style::Color::Magenta)
+        let span = if unicode.is_none() && custom_urls.contains_key(&r.name) {
+            Span::styled(label, Style::default().fg(theme::MAGENTA))
         } else {
-            Span::from(label).dim()
+            Span::styled(label, theme::muted())
         };
         current_width += label_width;
         current_spans.push(span);
@@ -1035,6 +1079,82 @@ mod tests {
     }
 
     #[test]
+    fn selection_preserves_halfblock_avatar_colors() -> color_eyre::Result<()> {
+        use crate::components::Component;
+        use crate::theme;
+        use color_eyre::eyre::ensure;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+        use ratatui_image::picker::Picker;
+
+        let color = Color::Rgb(240, 50, 60);
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16,
+            16,
+            image::Rgb([240, 50, 60]),
+        ));
+        let mut list = MessageList::new();
+        list.set_channel(vec![message("1.0", "U1", "hello")], "general".into());
+        list.avatar_protocols
+            .insert("U1".into(), Picker::halfblocks().new_resize_protocol(image));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
+        terminal.draw(|frame| list.render(frame, frame.area(), true))?;
+        let cells = &terminal.backend().buffer().content;
+        ensure!(
+            cells
+                .iter()
+                .any(|cell| cell.fg == color && cell.bg == color),
+            "selection overwrote the avatar's image colors"
+        );
+        ensure!(
+            cells.iter().any(|cell| cell.bg == theme::SELECTED),
+            "missing selection highlight"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_preserves_every_halfblock_preview_row() -> color_eyre::Result<()> {
+        use crate::components::Component;
+        use color_eyre::eyre::ensure;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+        use ratatui_image::picker::Picker;
+
+        let color = Color::Rgb(240, 50, 60);
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            160,
+            160,
+            image::Rgb([240, 50, 60]),
+        ));
+        let mut post = message("1.0", "U1", "hello");
+        post.files.push(serde_json::from_value(serde_json::json!({
+            "id": "F1", "name": "sample.png", "mimetype": "image/png"
+        }))?);
+        let mut list = MessageList::new();
+        list.set_channel(vec![post], "general".into());
+        list.insert_file_image("F1".into(), Picker::halfblocks().new_resize_protocol(image));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 16))?;
+        terminal.draw(|frame| list.render(frame, frame.area(), true))?;
+        let image_rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(40)
+            .filter(|row| row.iter().any(|cell| cell.fg == color && cell.bg == color))
+            .count();
+        ensure!(
+            image_rows == 8,
+            "expected 8 intact preview rows, got {image_rows}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn wrap_text_preserves_whitespace_runs_when_wrapping() {
         let text = "  foo    bar";
 
@@ -1087,6 +1207,58 @@ mod tests {
         // Moving up selects the older message, which has no files.
         list.select_prev_message();
         assert!(list.selected_message_files().is_empty());
+    }
+
+    #[test]
+    fn selected_message_text_preserves_original_contents() {
+        let mut list = MessageList::new();
+        let original = "\nfirst line\nsecond  line\n\t<@U2>\n";
+        list.set_channel(
+            vec![
+                message("2.0", "U1", original),
+                message("1.0", "U2", "older"),
+            ],
+            "general".into(),
+        );
+
+        assert_eq!(list.selected_message_text(), Some(original));
+
+        list.select_prev_message();
+        assert_eq!(list.selected_message_text(), Some("older"));
+    }
+
+    #[test]
+    fn selected_message_text_uses_thread_display_order() {
+        let mut list = MessageList::new();
+        list.set_thread(
+            "1.0".into(),
+            vec![
+                message("1.0", "U1", "thread root"),
+                message("2.0", "U2", "newest reply\nsecond line"),
+            ],
+        );
+
+        assert_eq!(
+            list.selected_message_text(),
+            Some("newest reply\nsecond line")
+        );
+
+        list.select_prev_message();
+        assert_eq!(list.selected_message_text(), Some("thread root"));
+    }
+
+    #[test]
+    fn copy_key_requests_selected_message_copy() {
+        use crate::action::Action;
+        use crate::components::{Component, EventResult};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut list = MessageList::new();
+        list.set_channel(vec![message("1.0", "U1", "hello")], "general".into());
+
+        let result = list.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert!(matches!(result, EventResult::Action(Action::CopyMessage)));
     }
 
     #[test]
@@ -1178,22 +1350,25 @@ mod tests {
         let mut list = MessageList::new();
         let picker = ratatui_image::picker::Picker::halfblocks();
 
-        for i in 0..=super::MAX_FILE_IMAGES {
+        for i in 0..=crate::components::messages::MAX_FILE_IMAGES {
             let img = image::DynamicImage::new_rgb8(1, 1);
             let evicted = list.insert_file_image(format!("k{i}"), picker.new_resize_protocol(img));
-            if i < super::MAX_FILE_IMAGES {
+            if i < crate::components::messages::MAX_FILE_IMAGES {
                 assert!(evicted.is_empty());
             } else {
                 assert_eq!(evicted, vec!["k0".to_string()]);
             }
         }
-        assert_eq!(list.file_image_protocols.len(), super::MAX_FILE_IMAGES);
+        assert_eq!(
+            list.file_image_protocols.len(),
+            crate::components::messages::MAX_FILE_IMAGES
+        );
         assert!(!list.file_image_protocols.contains_key("k0"));
     }
 
     #[test]
     fn file_size_formatting() {
-        use super::format_file_size;
+        use crate::components::messages::format_file_size;
 
         assert_eq!(format_file_size(0), "0 B");
         assert_eq!(format_file_size(512), "512 B");

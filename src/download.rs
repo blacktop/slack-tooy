@@ -122,7 +122,7 @@ fn numbered_name(file_name: &str, attempt: u32) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::*;
+    use crate::download::*;
 
     fn slack_file(name: &str, id: &str) -> SlackFile {
         SlackFile {

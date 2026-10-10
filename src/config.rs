@@ -70,7 +70,7 @@ impl Config {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::*;
+    use crate::config::*;
     use std::io::Write;
 
     #[test]

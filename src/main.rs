@@ -1,13 +1,18 @@
 mod action;
 mod app;
+mod browser;
 mod components;
 mod config;
 mod download;
 mod emoji;
 mod event;
 mod logging;
+mod message_links;
 mod slack;
 mod store;
+mod terminal_images;
+mod terminal_status;
+mod theme;
 mod tui;
 mod ui;
 
@@ -88,20 +93,15 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting slack-tooy");
 
-    // Query terminal image protocol support before entering raw mode
-    let picker = ratatui_image::picker::Picker::from_query_stdio().ok();
-    if picker.is_some() {
-        tracing::info!("Terminal image protocol detected");
-    }
-
     let store = store::Store::open()?;
 
     let (action_tx, action_rx) = mpsc::unbounded_channel();
 
     let mut tui = Tui::new()?;
-    let mut app = App::new(config, action_tx, picker, store)?;
+    let mut app = App::new(config, action_tx, None, store)?;
 
     tui.enter()?;
+    app.picker = terminal_images::picker();
     let result = app.run(&mut tui, action_rx).await;
     app.save_on_quit();
     tui.exit()?;

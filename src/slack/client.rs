@@ -21,6 +21,7 @@ const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_mins(10);
 #[derive(Clone)]
 pub struct SlackClient {
     client: Client,
+    api_base: String,
     token: String,
     /// Browser session cookie for xoxc- tokens.
     cookie: Option<String>,
@@ -41,9 +42,17 @@ impl SlackClient {
             .wrap_err("Failed to build HTTP client (TLS backend unavailable?)")?;
         Ok(Self {
             client,
+            api_base: SLACK_API_BASE.to_string(),
             token: token.to_string(),
             cookie,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_api_base(api_base: String) -> Result<Self> {
+        let mut client = Self::new("test-token", "")?;
+        client.api_base = api_base;
+        Ok(client)
     }
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -67,7 +76,7 @@ impl SlackClient {
         method: &str,
         params: &[(&str, &str)],
     ) -> Result<T> {
-        let url = format!("{SLACK_API_BASE}/{method}");
+        let url = format!("{}/{method}", self.api_base);
         // Retry once on transport errors (stale pooled connections).
         let builder = self.client.get(&url).query(params);
         let resp = match self.apply_auth(builder).send().await {
@@ -87,7 +96,7 @@ impl SlackClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<T> {
-        let url = format!("{SLACK_API_BASE}/{method}");
+        let url = format!("{}/{method}", self.api_base);
         let builder = self.client.post(&url).json(body);
         let resp = self.apply_auth(builder).send().await?;
 
@@ -99,7 +108,7 @@ impl SlackClient {
         method: &str,
         params: &[(&str, &str)],
     ) -> Result<T> {
-        let url = format!("{SLACK_API_BASE}/{method}");
+        let url = format!("{}/{method}", self.api_base);
         let body = urlencoded_body(params);
         let builder = self
             .client
@@ -275,6 +284,16 @@ impl SlackClient {
         }
 
         Ok(all_messages)
+    }
+
+    pub async fn add_reaction(&self, channel_id: &str, message_ts: &str, name: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "timestamp": message_ts,
+            "name": name,
+        });
+        let _: serde_json::Value = self.post("reactions.add", &body).await?;
+        Ok(())
     }
 
     pub async fn post_message(

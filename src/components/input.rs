@@ -1,13 +1,14 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use crate::action::Action;
 use crate::components::{Component, EventResult};
+use crate::theme;
 
 const PASTE_TAB_WIDTH: usize = 4;
 
@@ -165,11 +166,12 @@ impl Component for TextInput {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            ratatui::style::Style::default().green()
+        let title_style = if focused {
+            Style::default().fg(theme::GREEN).bold()
         } else {
-            ratatui::style::Style::default().dim()
+            theme::muted()
         };
+        let title = Line::from(Span::styled(" composer ", title_style));
 
         // Pre-wrap with the same algorithm used for cursor math and
         // height sizing, so the drawn text, the box height, and the
@@ -184,14 +186,22 @@ impl Component for TextInput {
         // content is taller than the box.
         let scroll_top = cursor_row.saturating_sub(inner_height.saturating_sub(1));
 
-        let text = Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>());
-        let input = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style)
-                    .title("Message".bold()),
+        let text = if self.text.is_empty() && !focused {
+            Text::from(vec![Line::from(Span::styled(
+                "Type a message.",
+                theme::muted(),
+            ))])
+        } else {
+            Text::from(
+                lines
+                    .into_iter()
+                    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme::TEXT))))
+                    .collect::<Vec<_>>(),
             )
+        };
+        let input = Paragraph::new(text)
+            .block(theme::panel_block(title, focused))
+            .style(theme::surface())
             .scroll((u16::try_from(scroll_top).unwrap_or(u16::MAX), 0));
 
         frame.render_widget(input, area);
@@ -410,7 +420,8 @@ mod tests {
         input.insert_char('\n');
         input.insert_char('c');
         let cursor_at = |input: &TextInput| {
-            let (_, row, col) = super::wrap_with_cursor(&input.text, input.cursor_pos, 80);
+            let (_, row, col) =
+                crate::components::input::wrap_with_cursor(&input.text, input.cursor_pos, 80);
             (row, col)
         };
         assert_eq!(cursor_at(&input), (1, 1));
@@ -427,7 +438,7 @@ mod tests {
         // Width 8: "hello world" must wrap after 8 columns, not at the
         // word boundary — the cursor math depends on it.
         let text: Vec<char> = "hello world".chars().collect();
-        let (lines, row, col) = super::wrap_with_cursor(&text, text.len(), 8);
+        let (lines, row, col) = crate::components::input::wrap_with_cursor(&text, text.len(), 8);
 
         assert_eq!(lines, vec!["hello wo".to_string(), "rld".to_string()]);
         assert_eq!((row, col), (1, 3));
@@ -435,12 +446,12 @@ mod tests {
 
     #[test]
     fn wrap_with_cursor_counts_wide_chars_by_display_width() {
-        // Each emoji is 2 columns wide: only two fit in width 5.
-        let text: Vec<char> = "🦀🦀🦀".chars().collect();
-        let (lines, row, col) = super::wrap_with_cursor(&text, text.len(), 5);
+        // Each wide character is 2 columns wide: only two fit in width 5.
+        let text: Vec<char> = "界界界".chars().collect();
+        let (lines, row, col) = crate::components::input::wrap_with_cursor(&text, text.len(), 5);
 
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "🦀🦀");
+        assert_eq!(lines[0], "界界");
         assert_eq!((row, col), (1, 2));
     }
 
@@ -448,13 +459,13 @@ mod tests {
     fn wrap_with_cursor_line_count_matches_visual_line_count() {
         let mut input = TextInput::new();
         input.insert_text("abcd\nef");
-        let (lines, _, _) = super::wrap_with_cursor(&input.text, 0, 3);
+        let (lines, _, _) = crate::components::input::wrap_with_cursor(&input.text, 0, 3);
         assert_eq!(u16::try_from(lines.len()), Ok(input.visual_line_count(3)));
     }
 
     #[test]
     fn wrap_with_cursor_empty_text_is_one_line() {
-        let (lines, row, col) = super::wrap_with_cursor(&[], 0, 10);
+        let (lines, row, col) = crate::components::input::wrap_with_cursor(&[], 0, 10);
         assert_eq!(lines, vec![String::new()]);
         assert_eq!((row, col), (0, 0));
     }

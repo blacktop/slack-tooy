@@ -1,15 +1,13 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Mode};
 use crate::components::Component;
-
-/// Slack brand aubergine (dark purple).
-const SLACK_AUBERGINE: Color = Color::Rgb(74, 21, 75);
+use crate::theme;
 
 /// Pane rectangles from the most recent layout pass, used to route
 /// mouse events.  Zero-sized rects (before the first render) contain
@@ -22,11 +20,14 @@ pub struct Panes {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    frame.render_widget(Block::default().style(theme::canvas()), frame.area());
+
     let [main_area, status_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
-    let [sidebar_area, right_area] = Layout::horizontal([
+    let [sidebar_area, _, right_area] = Layout::horizontal([
         Constraint::Ratio(app.config.sidebar_width, 12),
+        Constraint::Length(1),
         Constraint::Fill(1),
     ])
     .areas(main_area);
@@ -38,8 +39,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .visual_line_count(input_inner_width)
         .saturating_add(2)
         .min(8);
-    let [messages_area, input_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(input_height)]).areas(right_area);
+    let [messages_area, _, input_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(input_height),
+    ])
+    .areas(right_area);
 
     app.panes = Panes {
         sidebar: sidebar_area,
@@ -54,81 +59,117 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.input
         .render(frame, input_area, app.mode == Mode::Insert);
 
+    if let Some(ref mut popup) = app.reactions_popup {
+        popup.render(
+            frame,
+            messages_area,
+            &app.messages.user_cache,
+            &app.messages.custom_emoji_urls,
+        );
+    }
+    if let Some(ref picker) = app.reaction_picker {
+        picker.render(frame, messages_area);
+    }
+    if let Some(ref picker) = app.link_picker {
+        picker.render(frame, messages_area);
+    }
+
     render_status_bar(frame, status_area, app);
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans: Vec<Span> = Vec::new();
 
-    // App badge — Slack brand: white on aubergine
     spans.push(Span::styled(
-        " SLACK-TOOY ",
-        Style::default().fg(Color::White).bg(SLACK_AUBERGINE).bold(),
+        " TOOY ",
+        Style::default()
+            .fg(theme::TEXT)
+            .bg(theme::SURFACE_RAISED)
+            .bold(),
     ));
 
-    // Mode indicator — only show in INSERT mode (vim convention)
-    if app.mode == Mode::Insert {
-        spans.push(" INSERT ".bold().on_green());
-    }
-
-    // Focus indicator
-    let focus_label = match app.focus {
-        Focus::Sidebar => " Channels ",
-        Focus::Messages => " Messages ",
+    let mode = match app.mode {
+        Mode::Insert => Span::styled(
+            " INSERT ",
+            Style::default().fg(theme::CANVAS).bg(theme::GREEN).bold(),
+        ),
+        Mode::Normal => Span::styled(
+            " NORMAL ",
+            Style::default().fg(theme::TEXT_MUTED).bg(theme::SURFACE),
+        ),
     };
-    spans.push(Span::from(focus_label).dim());
+    spans.push(mode);
 
-    // Channel / thread context
+    let focus_label = match app.focus {
+        Focus::Sidebar => " nav ",
+        Focus::Messages => " history ",
+    };
+    spans.push(Span::styled(focus_label, theme::muted()));
+
     if let Some(ref id) = app.current_channel_id {
         let name = app.messages.channel_name.as_str();
         if name.is_empty() {
-            spans.push(Span::from(format!(" {id} ")).dim());
+            spans.push(Span::styled(format!(" {id} "), theme::muted()));
         } else {
-            spans.push(Span::from(format!(" #{name} ")).cyan());
+            spans.push(Span::styled(
+                format!(" #{name} "),
+                Style::default().fg(theme::BLUE).bg(theme::CANVAS),
+            ));
         }
         if app.messages.active_thread.is_some() {
-            spans.push(Span::from(" \u{21B3} Thread ").fg(ratatui::style::Color::Blue));
+            spans.push(Span::styled(" thread ", Style::default().fg(theme::BLUE)));
         }
     }
 
-    // Status / error
     if let Some(ref msg) = app.status_message {
-        spans.push(format!(" {msg} ").yellow());
+        spans.push(Span::styled(
+            format!(" {msg} "),
+            Style::default().fg(theme::YELLOW),
+        ));
     } else if app.loading {
-        spans.push(" Loading... ".yellow());
+        spans.push(Span::styled(
+            " Loading... ",
+            Style::default().fg(theme::YELLOW),
+        ));
     }
 
-    // Spacer (push hints to the right)
     let used: usize = spans.iter().map(Span::width).sum();
     let remaining = (area.width as usize).saturating_sub(used);
 
-    // Context-aware hints.  Shift+Enter only works on terminals with
-    // the kitty keyboard protocol; elsewhere it sends the message.
-    let hints = match app.mode {
-        Mode::Insert if app.keyboard_enhanced => "Esc:normal Enter:send Opt/Shift+Enter:newline",
-        Mode::Insert => "Esc:normal Enter:send Opt+Enter/Ctrl+J:newline",
-        Mode::Normal => match app.focus {
-            Focus::Sidebar => {
-                "q:quit i:insert Tab:messages Enter:open R:read-all u:unread j/k:\u{2195}"
+    let hints = if app.link_picker.is_some() {
+        "j/k:choose Enter:open Esc:cancel"
+    } else if app.reaction_picker.is_some() {
+        "type:search ↑/↓:choose Enter:add Esc:cancel"
+    } else if app.reactions_popup.is_some() {
+        "Esc/q:close j/k:scroll"
+    } else {
+        match app.mode {
+            Mode::Insert if app.keyboard_enhanced => {
+                "Esc:normal Enter:send Opt/Shift+Enter:newline"
             }
-            Focus::Messages => {
-                if app.messages.active_thread.is_some() {
-                    "q:quit i:reply h/\u{2190}:close d:save J/K:msg j/k:line"
-                } else {
-                    "q:quit i:insert Tab:channels l/\u{2192}:thread d:save J/K:msg j/k:line"
+            Mode::Insert => "Esc:normal Enter:send Opt+Enter/Ctrl+J:newline",
+            Mode::Normal => match app.focus {
+                Focus::Sidebar => {
+                    "q:quit i:insert Tab:history Enter:open R:read-all u:unread j/k:move"
                 }
-            }
-        },
+                Focus::Messages => {
+                    if app.messages.active_thread.is_some() {
+                        "q:quit i:reply h/Left:close R:react r:reactions o:open c:copy d:save J/K:msg j/k:line"
+                    } else {
+                        "q:quit i:insert Tab:nav l/Right:thread R:react r:reactions o:open c:copy d:save J/K:msg j/k:line"
+                    }
+                }
+            },
+        }
     };
 
-    // +2 for the " … " wrapper spaces around the hint text.
     let hint_width = UnicodeWidthStr::width(hints) + 2;
     if remaining > hint_width {
         let pad = remaining - hint_width;
         spans.push(Span::from(" ".repeat(pad)));
     }
-    spans.push(Span::from(format!(" {hints} ")).dim());
+    spans.push(Span::styled(format!(" {hints} "), theme::muted()));
 
     let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(line).style(theme::canvas()), area);
 }

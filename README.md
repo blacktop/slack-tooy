@@ -60,6 +60,8 @@ poll_interval_secs = 5         # how often to poll Slack for new messages (min 1
 
 All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and `SLACK_COOKIE` environment variables.
 
+Images are detected automatically. Rex Beta uses colored half-block characters because the tested client (build 1026) displays the image widget's Kitty Unicode placeholders as missing glyphs.
+
 ## Keybindings
 
 ### Global (Normal mode)
@@ -73,6 +75,8 @@ All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and 
 | `1` / `2` | Focus Channels / Messages directly |
 
 ### Channels panel
+
+Channels and Direct Messages start collapsed. Click a section header to toggle it, or press `Z` to expand all sections.
 
 | Key | Action |
 |-----|--------|
@@ -92,6 +96,10 @@ All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and 
 | `l` / Right | Open thread for selected message |
 | `h` / Left | Close thread |
 | `Enter` | Open thread (alias for `l`) |
+| `r` | Show who reacted to the selected message (Esc/`q`/`r` closes, `j`/`k` scrolls) |
+| `R` / `+` | Add a reaction to the selected message (type an emoji name, ↑/↓ or Tab to choose, Enter to add, Esc to cancel) |
+| `c` | Copy the selected message text with clean link URLs to the system clipboard |
+| `o` | Open a web link from the selected message (choose with `j`/`k` or arrows if there are several, Enter to open, Esc to cancel) |
 | `d` | Download files on the selected message to `~/Downloads` |
 | `Esc` | Close thread |
 | `g` / `G` | Scroll to top / bottom |
@@ -125,6 +133,10 @@ Mouse capture takes over the terminal's native text selection — hold `Shift`
 (most terminals) or `Option`/`Fn` (macOS Terminal.app/iTerm2) while dragging
 to select text normally.
 
+The reaction picker accepts names such as `:thumbsup:`, custom workspace emoji,
+and skin tones such as `thumbsup::skin-tone-4`. User and bot tokens need the
+[`reactions:write`](https://docs.slack.dev/reference/scopes/reactions.write/) scope.
+
 ## Data storage
 
 slack-tooy stores session and read-state data in a SQLite database:
@@ -137,10 +149,13 @@ Logs are written to the same directory under `logs/app.log`. Pass `--debug` for 
 ## Features
 
 - Channel and DM navigation with unread indicators
+- Unread section at the top of the sidebar gathering channels/DMs with new messages
+- New-chat terminal bells and [OSC 7501 status](https://www.superlogical.com/rex/docs/build/program-status) for Rex status indicators and event handlers; returning to the app clears the notice
 - Threaded conversations
 - Message sending and replies
 - User avatar display (on terminals that support image protocols)
 - Custom emoji rendering in reactions
+- Add emoji reactions to messages and thread replies
 - Unicode-aware text wrapping
 - Vim-style keybindings throughout
 - Session persistence (remembers last channel across restarts)

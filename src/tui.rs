@@ -1,10 +1,11 @@
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdout};
 
 use color_eyre::eyre::Result;
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -14,11 +15,14 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+use crate::terminal_status;
+
 pub type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub struct Tui {
     terminal: CrosstermTerminal,
     keyboard_enhanced: bool,
+    notification_active: bool,
 }
 
 impl Tui {
@@ -28,6 +32,7 @@ impl Tui {
         Ok(Self {
             terminal,
             keyboard_enhanced: false,
+            notification_active: false,
         })
     }
 
@@ -97,11 +102,19 @@ impl Tui {
         execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
+            DisableFocusChange,
             DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen,
             crossterm::cursor::Show
         )?;
+        terminal_status::clear(&mut io::stdout())?;
+        Ok(())
+    }
+
+    /// Enable after startup capability queries have drained their replies.
+    pub fn enable_focus_reporting(&mut self) -> Result<()> {
+        execute!(self.terminal.backend_mut(), EnableFocusChange)?;
         Ok(())
     }
 
@@ -114,9 +127,16 @@ impl Tui {
     }
 
     pub fn ring_bell(&mut self) -> Result<()> {
-        let backend = self.terminal.backend_mut();
-        backend.write_all(b"\x07")?;
-        backend.flush()?;
+        terminal_status::notify(self.terminal.backend_mut())?;
+        self.notification_active = true;
+        Ok(())
+    }
+
+    pub fn acknowledge_notification(&mut self) -> Result<()> {
+        if self.notification_active {
+            terminal_status::clear(self.terminal.backend_mut())?;
+            self.notification_active = false;
+        }
         Ok(())
     }
 }

@@ -202,6 +202,10 @@ fn parse_user_mention(mention: &str) -> Option<(&str, &str)> {
 pub struct Reaction {
     pub name: String,
     pub count: u32,
+    /// User ids who reacted.  Slack truncates this list on history
+    /// responses, so `count` can exceed `users.len()`.
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 /// Slack user from `users.info`.
@@ -325,7 +329,7 @@ pub struct ResponseMetadata {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::*;
+    use crate::slack::types::*;
 
     #[test]
     fn decode_conversations_list() {
@@ -426,6 +430,38 @@ mod tests {
         assert_eq!(msg.files[0].name, "report.pdf");
         assert_eq!(msg.files[0].size, 2_621_440);
         assert_eq!(msg.files[0].mimetype, "application/pdf");
+    }
+
+    #[test]
+    fn decode_message_reactions_with_users() {
+        let json = r#"{
+            "ok": true,
+            "messages": [
+                {
+                    "ts": "1712500200.000400",
+                    "user": "U1",
+                    "text": "ship it",
+                    "reactions": [
+                        {
+                            "name": "thumbsup",
+                            "count": 3,
+                            "users": ["U2", "U3"]
+                        },
+                        {
+                            "name": "tada",
+                            "count": 1
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let resp: SlackApiResponse<ConversationsHistoryData> =
+            serde_json::from_str(json).expect("decode");
+        let msg = &resp.data.messages[0];
+        assert_eq!(msg.reactions.len(), 2);
+        assert_eq!(msg.reactions[0].count, 3);
+        assert_eq!(msg.reactions[0].users, vec!["U2", "U3"]);
+        assert!(msg.reactions[1].users.is_empty());
     }
 
     #[test]

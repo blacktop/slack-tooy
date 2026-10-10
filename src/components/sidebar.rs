@@ -3,16 +3,15 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
 use crate::components::{Component, EventResult};
 use crate::slack::types::Channel;
+use crate::theme;
 
 /// Right padding inside the sidebar so text doesn't touch the border.
 const SIDEBAR_RIGHT_PAD: usize = 1;
@@ -49,7 +48,7 @@ impl ChannelSidebar {
             unread_channels: HashSet::new(),
             starred_channels: HashSet::new(),
             filter_unread: false,
-            collapsed_sections: HashSet::new(),
+            collapsed_sections: HashSet::from([Section::Channels, Section::DirectMessages]),
             dm_names: HashMap::new(),
             selected: 0,
             scroll_offset: 0,
@@ -60,8 +59,8 @@ impl ChannelSidebar {
     pub fn set_channels(&mut self, mut channels: Vec<Channel>) {
         let starred = &self.starred_channels;
         channels.sort_by(|a, b| {
-            (channel_section(starred, a) as u8)
-                .cmp(&(channel_section(starred, b) as u8))
+            (home_section(starred, a) as u8)
+                .cmp(&(home_section(starred, b) as u8))
                 .then_with(|| a.display_name().cmp(b.display_name()))
         });
         self.channels = channels;
@@ -77,8 +76,8 @@ impl ChannelSidebar {
         let selected_id = self.selected_channel().map(|ch| ch.id.clone());
         let starred = &self.starred_channels;
         self.channels.sort_by(|a, b| {
-            (channel_section(starred, a) as u8)
-                .cmp(&(channel_section(starred, b) as u8))
+            (home_section(starred, a) as u8)
+                .cmp(&(home_section(starred, b) as u8))
                 .then_with(|| a.display_name().cmp(b.display_name()))
         });
         if let Some(ref id) = selected_id
@@ -88,11 +87,21 @@ impl ChannelSidebar {
         }
     }
 
+    /// The section a channel is rendered under right now: `Unread`
+    /// while it has unread messages, its home section otherwise.
+    fn display_section(&self, ch: &Channel) -> Section {
+        if self.unread_channels.contains(&ch.id) {
+            Section::Unread
+        } else {
+            home_section(&self.starred_channels, ch)
+        }
+    }
+
     fn toggle_current_section(&mut self) {
         let Some(ch) = self.selected_channel() else {
             return;
         };
-        let section = channel_section(&self.starred_channels, ch);
+        let section = self.display_section(ch);
         self.toggle_section(section);
     }
 
@@ -117,7 +126,7 @@ impl ChannelSidebar {
     }
 
     pub fn channel_label(&self, ch: &Channel) -> String {
-        if ch.is_im.unwrap_or(false) {
+        if ch.is_im == Some(true) {
             self.dm_names
                 .get(&ch.user)
                 .cloned()
@@ -129,6 +138,9 @@ impl ChannelSidebar {
 
     pub fn mark_all_read(&mut self) {
         self.unread_channels.clear();
+        // Channels leave the Unread section for their home section; if
+        // that section is collapsed the selection would vanish.
+        self.snap_selection_to_visible();
     }
 
     pub fn snap_selection_to_visible(&mut self) {
@@ -138,20 +150,26 @@ impl ChannelSidebar {
         }
     }
 
-    /// Indices into `self.channels` that pass the current filter.
+    /// Indices into `self.channels` that pass the current filter, in
+    /// display order (grouped by section).  Vec order alone is wrong
+    /// here: unread channels render at the top regardless of where
+    /// they sit in the sorted list, and j/k must follow the screen.
     fn visible_indices(&self) -> Vec<usize> {
-        self.channels
-            .iter()
-            .enumerate()
-            .filter(|(_, ch)| {
+        let mut indices = Vec::with_capacity(self.channels.len());
+        for &section in &SECTIONS {
+            if self.collapsed_sections.contains(&section) {
+                continue;
+            }
+            for (i, ch) in self.channels.iter().enumerate() {
                 if self.filter_unread && !self.unread_channels.contains(&ch.id) {
-                    return false;
+                    continue;
                 }
-                let section = channel_section(&self.starred_channels, ch);
-                !self.collapsed_sections.contains(&section)
-            })
-            .map(|(i, _)| i)
-            .collect()
+                if self.display_section(ch) == section {
+                    indices.push(i);
+                }
+            }
+        }
+        indices
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -190,7 +208,7 @@ impl ChannelSidebar {
     fn section_exists(&self, section: Section) -> bool {
         self.channels
             .iter()
-            .any(|ch| channel_section(&self.starred_channels, ch) == section)
+            .any(|ch| self.display_section(ch) == section)
     }
 
     /// Should a section header be shown?  Yes if the section has
@@ -204,7 +222,7 @@ impl ChannelSidebar {
         }
         visible
             .iter()
-            .any(|&i| channel_section(&self.starred_channels, &self.channels[i]) == section)
+            .any(|&i| self.display_section(&self.channels[i]) == section)
     }
 
     fn ensure_visible(&mut self, visible: &[usize], visible_height: usize) {
@@ -239,7 +257,7 @@ impl ChannelSidebar {
             }
             rows.push(RowTarget::Header(section));
             for &ci in visible {
-                if channel_section(&self.starred_channels, &self.channels[ci]) == section {
+                if self.display_section(&self.channels[ci]) == section {
                     rows.push(RowTarget::Channel(ci));
                 }
             }
@@ -309,22 +327,19 @@ impl Component for ChannelSidebar {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            ratatui::style::Style::default().cyan()
-        } else {
-            ratatui::style::Style::default().dim()
-        };
-
         let title = if self.filter_unread {
-            " Unread Only ".bold().yellow()
+            Line::from(vec![
+                Span::styled(" unread ", Style::default().fg(theme::YELLOW).bold()),
+                Span::styled(format!("{} ", self.unread_channels.len()), theme::muted()),
+            ])
         } else {
-            " Channels ".bold().cyan()
+            Line::from(Span::styled(
+                " channels ",
+                Style::default().fg(theme::TEXT).bold(),
+            ))
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(title);
+        let block = theme::panel_block(title, focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.last_inner = inner;
@@ -342,15 +357,16 @@ impl Component for ChannelSidebar {
             let line = match row {
                 RowTarget::Header(section) => {
                     let collapsed = self.collapsed_sections.contains(&section);
-                    let chevron = if collapsed { "▸" } else { "▾" };
-                    Line::from(format!(" {chevron} {}", section.label()))
-                        .bold()
-                        .dim()
+                    let marker = if collapsed { "+" } else { "-" };
+                    Line::from(vec![
+                        Span::styled(format!(" {marker} "), theme::muted()),
+                        Span::styled(section.label(), Style::default().fg(theme::TEXT_MUTED)),
+                    ])
                 }
                 RowTarget::Channel(ci) => {
                     let ch = &self.channels[ci];
-                    let is_dm = ch.is_im.unwrap_or(false);
-                    let prefix = if is_dm { "  " } else { " # " };
+                    let is_dm = ch.is_im == Some(true);
+                    let prefix = if is_dm { " @ " } else { " # " };
                     let channel_label = self.channel_label(ch);
                     let selected = ci == self.selected;
                     let has_unread = self.unread_channels.contains(&ch.id);
@@ -365,22 +381,25 @@ impl Component for ChannelSidebar {
 
                     if selected {
                         Line::from(vec![
-                            Span::from(">").bold().cyan(),
-                            Span::from(text).bold().cyan(),
+                            Span::styled(">", Style::default().fg(theme::BLUE).bold()),
+                            Span::styled(text, theme::selected().bold()),
                         ])
                     } else if has_unread {
                         Line::from(vec![
                             Span::from(" "),
-                            Span::from(text).bold().yellow(),
-                            Span::from(" *").bold().yellow(),
+                            Span::styled(text, Style::default().fg(theme::YELLOW).bold()),
+                            Span::styled(" *", Style::default().fg(theme::YELLOW).bold()),
                         ])
                     } else if is_dm {
                         Line::from(vec![
                             Span::from(" "),
-                            Span::from(text).fg(Color::Rgb(160, 165, 200)),
+                            Span::styled(text, Style::default().fg(theme::MAGENTA)),
                         ])
                     } else {
-                        Line::from(vec![Span::from(" "), Span::from(text)])
+                        Line::from(vec![
+                            Span::from(" "),
+                            Span::styled(text, Style::default().fg(theme::TEXT)),
+                        ])
                     }
                 }
             };
@@ -388,7 +407,7 @@ impl Component for ChannelSidebar {
         }
 
         if lines.is_empty() && self.filter_unread {
-            lines.push(Line::from(Span::from("  All caught up!").dim()));
+            lines.push(Line::from(Span::styled("  All caught up.", theme::muted())));
         }
 
         let end = (self.scroll_offset + visible_height).min(lines.len());
@@ -408,27 +427,37 @@ impl Component for ChannelSidebar {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Section {
-    Starred = 0,
-    Channels = 1,
-    DirectMessages = 2,
+    Unread = 0,
+    Starred = 1,
+    Channels = 2,
+    DirectMessages = 3,
 }
 
 impl Section {
     const fn label(self) -> &'static str {
         match self {
-            Section::Starred => "⭐ Starred",
+            Section::Unread => "* Unread",
+            Section::Starred => "Starred",
             Section::Channels => "# Channels",
-            Section::DirectMessages => "💬 Direct Messages",
+            Section::DirectMessages => "@ Direct messages",
         }
     }
 }
 
-const SECTIONS: [Section; 3] = [Section::Starred, Section::Channels, Section::DirectMessages];
+const SECTIONS: [Section; 4] = [
+    Section::Unread,
+    Section::Starred,
+    Section::Channels,
+    Section::DirectMessages,
+];
 
-fn channel_section(starred: &HashSet<String>, ch: &Channel) -> Section {
+/// The section a channel belongs to when it has no unread messages.
+/// Used as the stable sort key; unread status is applied on top at
+/// display time by `display_section` so reads never reorder the list.
+fn home_section(starred: &HashSet<String>, ch: &Channel) -> Section {
     if starred.contains(&ch.id) {
         Section::Starred
-    } else if ch.is_im.unwrap_or(false) {
+    } else if ch.is_im == Some(true) {
         Section::DirectMessages
     } else {
         Section::Channels
@@ -462,7 +491,11 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ratatui::layout::{Position, Rect};
+
+    use crate::action::Action;
+    use crate::components::sidebar::{ChannelSidebar, RowTarget, Section};
+    use crate::slack::types::Channel;
 
     fn channel(id: &str, name: &str) -> Channel {
         Channel {
@@ -487,9 +520,10 @@ mod tests {
     }
 
     /// Sidebar with rows: [# Channels header, #alpha, #beta,
-    /// 💬 DMs header, dm U1] rendered into a 20x10 inner area.
+    /// @ DMs header, dm U1] rendered into a 20x10 inner area.
     fn rendered_sidebar() -> ChannelSidebar {
         let mut sidebar = ChannelSidebar::new();
+        sidebar.expand_all_sections();
         sidebar.set_channels(vec![
             channel("C1", "alpha"),
             channel("C2", "beta"),
@@ -533,7 +567,7 @@ mod tests {
         let mut sidebar = rendered_sidebar();
         sidebar.scroll_offset = 3;
 
-        // Inner row 0 + offset 3 = row 3 = "💬 Direct Messages" header.
+        // Inner row 0 + offset 3 = row 3 = "@ Direct messages" header.
         let action = sidebar.handle_click(Position::new(3, 1));
 
         assert!(action.is_none());
@@ -593,6 +627,138 @@ mod tests {
             ]
         );
         let _ = visible;
+    }
+
+    #[test]
+    fn unread_channels_group_under_unread_section() {
+        let mut sidebar = rendered_sidebar();
+        sidebar.unread_channels.insert("C2".into());
+        sidebar.unread_channels.insert("D1".into());
+
+        let visible = sidebar.visible_indices();
+        let rows = sidebar.visible_rows(&visible);
+
+        // #beta (C2) and the DM move to the top; #alpha keeps its
+        // home section.
+        assert_eq!(
+            rows,
+            vec![
+                RowTarget::Header(Section::Unread),
+                RowTarget::Channel(1),
+                RowTarget::Channel(2),
+                RowTarget::Header(Section::Channels),
+                RowTarget::Channel(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_home_sections_still_render_unread_channels_at_the_top() -> color_eyre::Result<()> {
+        use color_eyre::eyre::ensure;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::components::Component;
+
+        let mut sidebar = ChannelSidebar::new();
+        sidebar.set_channels(vec![
+            channel("C1", "alpha"),
+            channel("C2", "beta"),
+            dm("D1", "U1"),
+        ]);
+        sidebar.unread_channels.insert("C2".into());
+        sidebar.unread_channels.insert("D1".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(32, 8))?;
+        terminal.draw(|frame| sidebar.render(frame, frame.area(), false))?;
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(32)
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect();
+
+        ensure!(rows[1].contains("- * Unread"));
+        ensure!(rows[2].contains("# beta"));
+        ensure!(rows[3].contains("@ U1"));
+        ensure!(rows[4].contains("+ # Channels"));
+        ensure!(!rows.iter().any(|row| row.contains("alpha")));
+        Ok(())
+    }
+
+    #[test]
+    fn reading_a_channel_returns_it_to_home_section() {
+        let mut sidebar = rendered_sidebar();
+        sidebar.unread_channels.insert("C2".into());
+        sidebar.unread_channels.remove("C2");
+
+        let visible = sidebar.visible_indices();
+        let rows = sidebar.visible_rows(&visible);
+
+        assert_eq!(
+            rows,
+            vec![
+                RowTarget::Header(Section::Channels),
+                RowTarget::Channel(0),
+                RowTarget::Channel(1),
+                RowTarget::Header(Section::DirectMessages),
+                RowTarget::Channel(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_follows_display_order_with_unread_on_top() {
+        let mut sidebar = rendered_sidebar();
+        sidebar.unread_channels.insert("D1".into());
+        sidebar.select_first();
+
+        // Display order: dm U1 (Unread), #alpha, #beta.
+        assert_eq!(
+            sidebar.selected_channel().map(|c| c.id.as_str()),
+            Some("D1")
+        );
+        sidebar.handle_scroll(false);
+        assert_eq!(
+            sidebar.selected_channel().map(|c| c.id.as_str()),
+            Some("C1")
+        );
+        sidebar.handle_scroll(false);
+        assert_eq!(
+            sidebar.selected_channel().map(|c| c.id.as_str()),
+            Some("C2")
+        );
+    }
+
+    #[test]
+    fn collapsing_unread_section_hides_its_channels() {
+        let mut sidebar = rendered_sidebar();
+        sidebar.unread_channels.insert("C1".into());
+        sidebar.selected = 0;
+        sidebar.toggle_current_section();
+
+        assert!(sidebar.collapsed_sections.contains(&Section::Unread));
+        let visible = sidebar.visible_indices();
+        assert!(!visible.contains(&0));
+        // Selection snapped to a visible channel.
+        assert_ne!(sidebar.selected, 0);
+    }
+
+    #[test]
+    fn mark_all_read_snaps_selection_out_of_collapsed_home() {
+        let mut sidebar = rendered_sidebar();
+        sidebar.unread_channels.insert("C1".into());
+        sidebar.selected = 0;
+        // Collapse the home section while #alpha sits under Unread.
+        sidebar.toggle_section(Section::Channels);
+
+        sidebar.mark_all_read();
+
+        // #alpha returned to the collapsed Channels section; selection
+        // must land on something still visible.
+        let visible = sidebar.visible_indices();
+        assert!(visible.contains(&sidebar.selected));
     }
 
     #[test]

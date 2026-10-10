@@ -18,6 +18,14 @@ pub enum ErrorContext {
     Send,
     /// Per-file save-to-disk download.
     Download,
+    /// reactions.add for an exact message.
+    Reaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionTarget {
+    pub channel_id: String,
+    pub message_ts: String,
 }
 
 /// Every state mutation expressed as data.
@@ -51,10 +59,26 @@ pub enum Action {
     // Message sending (from input component)
     SendMessage,
 
+    // Toggle the who-reacted popup for the selected message
+    ToggleReactions,
+    OpenReactionPicker,
+    CloseReactionPicker,
+    SubmitReaction,
+
     // Save files attached to the selected message to disk
     DownloadFiles,
+    // Copy message text with Slack link markup replaced by its destination
+    CopyMessage,
+    OpenMessageLink,
+    CloseLinkPicker,
+    OpenUrl(reqwest::Url),
+    BrowserFinished(Result<(), String>),
 
     // Async results from Slack API
+    ReactionAdded {
+        target: ReactionTarget,
+        name: String,
+    },
     ChannelsLoaded(Vec<Channel>),
     MessagesLoaded {
         channel_id: String,

@@ -1,5 +1,9 @@
 pub mod input;
+pub mod link_picker;
+mod markdown;
 pub mod messages;
+pub mod reaction_picker;
+pub mod reactions;
 pub mod sidebar;
 
 use crossterm::event::KeyEvent;
