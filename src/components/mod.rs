@@ -1,3 +1,5 @@
+pub mod activity;
+pub mod help;
 pub mod input;
 pub mod link_picker;
 mod markdown;

@@ -1,3 +1,4 @@
+use crate::activity::{ActivitySnapshot, ThreadTarget};
 use crate::slack::types::{Channel, SlackMessage};
 
 /// Which async operation an [`Action::Error`] belongs to.
@@ -12,8 +13,6 @@ pub enum ErrorContext {
     ChannelList,
     /// Foreground channel-history load (open or thread-close reload).
     ChannelLoad,
-    /// conversations.replies fetch while opening a thread.
-    ThreadOpen,
     /// chat.postMessage or file upload.
     Send,
     /// Per-file save-to-disk download.
@@ -35,6 +34,8 @@ pub enum Action {
     Tick,
     Render,
     Quit,
+    OpenHelp,
+    CloseHelp,
 
     // Mode transitions
     EnterNormalMode,
@@ -46,6 +47,22 @@ pub enum Action {
 
     // Enter on a channel: open + focus messages + mark read
     OpenChannel,
+    // Open the conversation named by the most recent new-chat notification.
+    OpenLatestNotification,
+    OpenActivity,
+    RefreshActivity,
+    ReadActivity,
+    OpenActivityThread(ThreadTarget),
+    ActivityLoaded(Result<ActivitySnapshot, String>),
+    ThreadReadFinished {
+        target: ThreadTarget,
+        ts: String,
+        result: Result<(), String>,
+    },
+    ThreadOpenFailed {
+        target: ThreadTarget,
+        message: String,
+    },
     // Mark all channels as read
     MarkAllRead,
     // Toggle between showing all channels vs only unread

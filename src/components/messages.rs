@@ -129,10 +129,6 @@ impl MessageList {
         self.line_cache = None;
     }
 
-    pub fn read_marker_ts(&self) -> Option<&str> {
-        self.read_marker_ts.as_deref()
-    }
-
     /// Number of messages in display order.
     fn message_count(&self) -> usize {
         self.messages.len()

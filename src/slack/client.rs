@@ -11,6 +11,7 @@ use crate::slack::types::{
     User, UserInfoData,
 };
 
+const MAX_API_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const SLACK_API_BASE: &str = "https://slack.com/api";
 const URLENCODE_HEX: &[u8; 16] = b"0123456789ABCDEF";
 /// Full-size file transfers (uploads and downloads) get a longer
@@ -103,7 +104,7 @@ impl SlackClient {
         Self::decode_api_response(method, resp).await
     }
 
-    async fn post_urlencoded<T: serde::de::DeserializeOwned>(
+    pub(crate) async fn post_urlencoded<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         params: &[(&str, &str)],
@@ -125,18 +126,21 @@ impl SlackClient {
 
     async fn decode_api_response<T: serde::de::DeserializeOwned>(
         method: &str,
-        resp: reqwest::Response,
+        mut resp: reqwest::Response,
     ) -> Result<T> {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .wrap_err_with(|| format!("Failed to read Slack API {method} response body"))?;
         if !status.is_success() {
             bail!("Slack API {method} HTTP error: {status}");
         }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if chunk.len() > MAX_API_RESPONSE_BYTES.saturating_sub(body.len()) {
+                bail!("Slack API {method} response exceeds 8 MiB");
+            }
+            body.extend_from_slice(&chunk);
+        }
 
-        let value: serde_json::Value = serde_json::from_str(&body)
+        let value: serde_json::Value = serde_json::from_slice(&body)
             .wrap_err_with(|| format!("Slack API {method} returned a non-JSON response"))?;
         if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             let error = Self::api_error_message(&value);
@@ -260,10 +264,24 @@ impl SlackClient {
         channel_id: &str,
         thread_ts: &str,
     ) -> Result<Vec<SlackMessage>> {
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            self.fetch_replies_pages(channel_id, thread_ts),
+        )
+        .await
+        .wrap_err("Thread fetch timed out")?
+    }
+
+    async fn fetch_replies_pages(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+    ) -> Result<Vec<SlackMessage>> {
         let mut all_messages = Vec::new();
         let mut cursor = String::new();
 
-        loop {
+        let mut seen_cursors = HashSet::new();
+        for _ in 0..50 {
             let params = vec![
                 ("channel", channel_id),
                 ("ts", thread_ts),
@@ -271,6 +289,9 @@ impl SlackClient {
                 ("cursor", &cursor),
             ];
             let data: ConversationsHistoryData = self.get("conversations.replies", &params).await?;
+            if data.messages.len() > 10_000_usize.saturating_sub(all_messages.len()) {
+                bail!("Thread exceeds the 10000-message limit");
+            }
             all_messages.extend(data.messages);
 
             match data
@@ -278,12 +299,15 @@ impl SlackClient {
                 .and_then(|m| m.next_cursor)
                 .filter(|c| !c.is_empty())
             {
-                Some(next) => cursor = next,
-                None => break,
+                Some(next) if next.len() <= 2048 && seen_cursors.insert(next.clone()) => {
+                    cursor = next;
+                }
+                Some(_) => bail!("Thread pagination cursor did not advance"),
+                None => return Ok(all_messages),
             }
         }
 
-        Ok(all_messages)
+        bail!("Thread exceeds the 50-page limit")
     }
 
     pub async fn add_reaction(&self, channel_id: &str, message_ts: &str, name: &str) -> Result<()> {

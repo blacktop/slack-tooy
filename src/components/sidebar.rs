@@ -125,15 +125,32 @@ impl ChannelSidebar {
             .insert(user_id.to_string(), display_name.to_string());
     }
 
-    pub fn channel_label(&self, ch: &Channel) -> String {
+    pub fn channel_label<'a>(&'a self, ch: &'a Channel) -> &'a str {
         if ch.is_im == Some(true) {
             self.dm_names
                 .get(&ch.user)
-                .cloned()
-                .unwrap_or_else(|| ch.user.clone())
+                .map_or(ch.user.as_str(), String::as_str)
         } else {
-            ch.display_name().to_string()
+            ch.display_name()
         }
+    }
+
+    /// Select a known conversation even when its section is collapsed or the
+    /// unread filter currently hides it.
+    pub fn select_channel(&mut self, channel_id: &str) -> bool {
+        let Some(index) = self.channels.iter().position(|ch| ch.id == channel_id) else {
+            return false;
+        };
+        let Some(channel) = self.channels.get(index) else {
+            return false;
+        };
+        let section = self.display_section(channel);
+        self.collapsed_sections.remove(&section);
+        if !self.unread_channels.contains(channel_id) {
+            self.filter_unread = false;
+        }
+        self.selected = index;
+        true
     }
 
     pub fn mark_all_read(&mut self) {
@@ -376,7 +393,7 @@ impl Component for ChannelSidebar {
                     let prefix_width = UnicodeWidthStr::width(prefix);
                     let label_budget =
                         max_text_width.saturating_sub(gutter_width + prefix_width + suffix_width);
-                    let display_label = truncate_with_ellipsis(&channel_label, label_budget);
+                    let display_label = truncate_with_ellipsis(channel_label, label_budget);
                     let text = format!("{prefix}{display_label}");
 
                     if selected {
@@ -466,7 +483,7 @@ fn home_section(starred: &HashSet<String>, ch: &Channel) -> Section {
 
 /// Truncate `text` to fit within `max_width` display columns,
 /// appending `…` when content is clipped.
-fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
+pub(crate) fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
     let text_width = UnicodeWidthStr::width(text);
     if text_width <= max_width {
         return text.to_string();
@@ -531,6 +548,27 @@ mod tests {
         ]);
         sidebar.last_inner = Rect::new(1, 1, 20, 10);
         sidebar
+    }
+
+    #[test]
+    fn selecting_a_notification_reveals_its_exact_hidden_conversation() {
+        for id in ["C1", "D1"] {
+            let mut sidebar = ChannelSidebar::new();
+            sidebar.set_channels(vec![channel("C1", "alpha"), dm("D1", "U1")]);
+            sidebar.filter_unread = true;
+            assert!(sidebar.visible_indices().is_empty());
+            assert!(sidebar.select_channel(id));
+            assert!(sidebar.visible_indices().contains(&sidebar.selected));
+            assert_eq!(
+                sidebar.selected_channel().map(|ch| ch.id.as_str()),
+                Some(id)
+            );
+            assert!(!sidebar.select_channel("missing"));
+            assert_eq!(
+                sidebar.selected_channel().map(|ch| ch.id.as_str()),
+                Some(id)
+            );
+        }
     }
 
     #[test]

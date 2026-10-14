@@ -21,7 +21,6 @@ pub type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub struct Tui {
     terminal: CrosstermTerminal,
-    keyboard_enhanced: bool,
     notification_active: bool,
 }
 
@@ -31,16 +30,8 @@ impl Tui {
         let terminal = Terminal::new(backend)?;
         Ok(Self {
             terminal,
-            keyboard_enhanced: false,
             notification_active: false,
         })
-    }
-
-    /// Whether the terminal reports modified keys (kitty keyboard
-    /// protocol).  Without it Shift+Enter is indistinguishable from
-    /// plain Enter.
-    pub fn keyboard_enhanced(&self) -> bool {
-        self.keyboard_enhanced
     }
 
     pub fn enter(&mut self) -> Result<()> {
@@ -65,8 +56,7 @@ impl Tui {
         // Opt in to disambiguated key reports so modifiers on Enter
         // (Shift+Enter newline) reach us.  The protocol is opt-in per
         // application even on terminals that support it.
-        self.keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
-        if self.keyboard_enhanced {
+        if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -126,8 +116,8 @@ impl Tui {
         Ok(())
     }
 
-    pub fn ring_bell(&mut self) -> Result<()> {
-        terminal_status::notify(self.terminal.backend_mut())?;
+    pub fn notify_chat(&mut self, notification: &terminal_status::ChatNotification) -> Result<()> {
+        terminal_status::notify(self.terminal.backend_mut(), notification)?;
         self.notification_active = true;
         Ok(())
     }

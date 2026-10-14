@@ -1,4 +1,5 @@
 mod action;
+mod activity;
 mod app;
 mod browser;
 mod components;

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -10,6 +10,9 @@ use ratatui::layout::Position;
 use tokio::sync::mpsc;
 
 use crate::action::{Action, ErrorContext, ReactionTarget};
+use crate::activity::{ActivityInbox, MAX_ACTIVITY_ITEMS, ThreadTarget};
+use crate::components::activity::ActivityView;
+use crate::components::help::HelpPopup;
 use crate::components::input::TextInput;
 use crate::components::link_picker::LinkPicker;
 use crate::components::messages::MessageList;
@@ -22,6 +25,7 @@ use crate::event::{AppEvent, EventHandler};
 use crate::slack::client::SlackClient;
 use crate::slack::types::{Channel, SlackFile, SlackMessage, is_slack_user_id, mentioned_user_ids};
 use crate::store::Store;
+use crate::terminal_status::ChatNotification;
 use crate::tui::Tui;
 use crate::ui;
 use ratatui_image::picker::Picker;
@@ -46,12 +50,6 @@ enum LoadReason {
     ChannelOpen,
     /// Reloading after closing a thread — don't mark as read.
     ThreadClose,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalBell {
-    Idle,
-    Pending,
 }
 
 #[derive(Debug)]
@@ -113,10 +111,18 @@ pub struct App {
     pub sidebar: ChannelSidebar,
     pub messages: MessageList,
     pub input: TextInput,
+    pub activity: ActivityView,
+    pub activity_open: bool,
+    activity_request: Option<BoxFuture<'static, Action>>,
+    thread_read_request: Option<BoxFuture<'static, Action>>,
+    thread_read_queue: VecDeque<(ThreadTarget, String)>,
+    last_activity_poll: Option<Instant>,
+    latest_notified_thread: Option<ThreadTarget>,
     /// Who-reacted overlay for the selected message, when open.
     pub reactions_popup: Option<ReactionsPopup>,
     pub reaction_picker: Option<ReactionPicker>,
     pub link_picker: Option<LinkPicker>,
+    pub help_popup: Option<HelpPopup>,
     /// The pending mutation is polled by the UI loop so its result is observed.
     reaction_request: Option<BoxFuture<'static, Action>>,
     browser_request: Option<BoxFuture<'static, Action>>,
@@ -158,9 +164,6 @@ pub struct App {
     /// Lazily initialized system clipboard. Keeping the handle alive is
     /// required by some clipboard backends after setting its contents.
     clipboard: Option<arboard::Clipboard>,
-    /// Whether the terminal reports modified keys (kitty keyboard
-    /// protocol) — controls the Shift+Enter hint.
-    pub keyboard_enhanced: bool,
     /// Pane rectangles from the last layout pass, for mouse routing.
     pub panes: crate::ui::Panes,
     /// Thread ts currently being fetched — thread mode enters only
@@ -171,7 +174,8 @@ pub struct App {
     /// arrives so stale thread replies are never shown under the
     /// channel title.
     closing_thread: bool,
-    pending_terminal_bell: TerminalBell,
+    pending_terminal_notification: Option<ChatNotification>,
+    latest_notified_channel: Option<String>,
     terminal_focused: bool,
     pub status_message: Option<String>,
     pub loading: bool,
@@ -347,9 +351,17 @@ impl App {
             sidebar: ChannelSidebar::new(),
             messages: MessageList::new(),
             input: TextInput::new(),
+            activity: ActivityView::default(),
+            activity_open: false,
+            activity_request: None,
+            thread_read_request: None,
+            thread_read_queue: VecDeque::new(),
+            last_activity_poll: None,
+            latest_notified_thread: None,
             reactions_popup: None,
             reaction_picker: None,
             link_picker: None,
+            help_popup: None,
             reaction_request: None,
             browser_request: None,
             slack,
@@ -370,11 +382,11 @@ impl App {
             in_flight_send_text: None,
             download_batch: None,
             clipboard: None,
-            keyboard_enhanced: false,
             panes: crate::ui::Panes::default(),
             pending_thread: None,
             closing_thread: false,
-            pending_terminal_bell: TerminalBell::Idle,
+            pending_terminal_notification: None,
+            latest_notified_channel: None,
             // An app may start in an inactive tab. Wait for a focus report
             // or user input before suppressing current-channel alerts.
             terminal_focused: false,
@@ -392,7 +404,6 @@ impl App {
     ) -> Result<()> {
         tui.enable_focus_reporting()?;
         let mut events = EventHandler::new(self.config.tick_rate(), action_rx);
-        self.keyboard_enhanced = tui.keyboard_enhanced();
 
         self.validate_auth();
         self.load_channels();
@@ -406,6 +417,14 @@ impl App {
                 event = events.next() => event?,
                 Some(action) = OptionFuture::from(self.reaction_request.as_mut()) => {
                     self.reaction_request = None;
+                    AppEvent::BackgroundAction(action)
+                }
+                Some(action) = OptionFuture::from(self.activity_request.as_mut()) => {
+                    self.activity_request = None;
+                    AppEvent::BackgroundAction(action)
+                }
+                Some(action) = OptionFuture::from(self.thread_read_request.as_mut()) => {
+                    self.thread_read_request = None;
                     AppEvent::BackgroundAction(action)
                 }
                 Some(action) = OptionFuture::from(self.browser_request.as_mut()) => {
@@ -434,8 +453,8 @@ impl App {
             };
 
             self.update(action);
-            if self.take_pending_terminal_bell() {
-                tui.ring_bell()?;
+            if let Some(notification) = self.pending_terminal_notification.take() {
+                tui.notify_chat(&notification)?;
             }
 
             if self.should_quit {
@@ -447,6 +466,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(help) = self.help_popup.as_mut() {
+            return help.handle_key(key);
+        }
         if let Some(picker) = self.link_picker.as_mut() {
             return picker.handle_key(key);
         }
@@ -478,10 +500,12 @@ impl App {
         }
 
         match (key.code, ctrl) {
+            (KeyCode::Char('?'), false) => Action::OpenHelp,
             // Quit
             (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => Action::Quit,
             // Insert mode
-            (KeyCode::Char('i'), false) => Action::EnterInsertMode,
+            (KeyCode::Char('i'), false) if !self.activity_open => Action::EnterInsertMode,
+            (KeyCode::Char('a'), false) => Action::OpenActivity,
             // Focus toggle — Tab always switches panels.
             // Right arrow from Sidebar enters Messages; from Messages
             // it falls through to the message handler (→ opens thread).
@@ -492,7 +516,9 @@ impl App {
             },
             (KeyCode::Right, _) if self.focus == Focus::Sidebar => Action::FocusMessages,
             (KeyCode::Left, _)
-                if self.focus == Focus::Messages && self.messages.active_thread.is_some() =>
+                if self.focus == Focus::Messages
+                    && !self.activity_open
+                    && self.messages.active_thread.is_some() =>
             {
                 Action::CloseThread
             }
@@ -500,9 +526,11 @@ impl App {
             // Number shortcuts: direct pane access
             (KeyCode::Char('1'), false) => Action::FocusSidebar,
             (KeyCode::Char('2'), false) => Action::FocusMessages,
+            (KeyCode::Char('N'), false) => Action::OpenLatestNotification,
             _ => {
                 let result = match self.focus {
                     Focus::Sidebar => self.sidebar.handle_key(key),
+                    Focus::Messages if self.activity_open => return self.activity.handle_key(key),
                     Focus::Messages => self.messages.handle_key(key),
                 };
                 match result {
@@ -522,7 +550,7 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) -> Action {
-        if self.link_picker.is_some() {
+        if self.help_popup.is_some() || self.link_picker.is_some() {
             return Action::Render;
         }
         if let Some(picker) = self.reaction_picker.as_mut() {
@@ -536,6 +564,14 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if let Some(help) = self.help_popup.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => help.scroll(true, 3),
+                MouseEventKind::ScrollDown => help.scroll(false, 3),
+                _ => {}
+            }
+            return Action::Render;
+        }
         if let Some(picker) = self.link_picker.as_mut() {
             match mouse.kind {
                 MouseEventKind::ScrollUp => picker.move_selection(true),
@@ -577,7 +613,11 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = mouse.kind == MouseEventKind::ScrollUp;
                 if self.panes.messages.contains(position) {
-                    self.messages.handle_scroll(up);
+                    if self.activity_open {
+                        self.activity.move_selection(up);
+                    } else {
+                        self.messages.handle_scroll(up);
+                    }
                 } else if self.panes.sidebar.contains(position) {
                     self.sidebar.handle_scroll(up);
                 }
@@ -593,6 +633,9 @@ impl App {
     }
 
     fn handle_left_click(&mut self, position: Position) -> Action {
+        if self.panes.activity.contains(position) {
+            return Action::OpenActivity;
+        }
         if self.panes.sidebar.contains(position) {
             self.mode = Mode::Normal;
             // A channel row returns OpenChannel (which focuses the
@@ -604,6 +647,10 @@ impl App {
         }
         if self.panes.messages.contains(position) {
             self.mode = Mode::Normal;
+            if self.activity_open {
+                self.focus = Focus::Messages;
+                return self.activity.handle_click(position);
+            }
             self.messages.handle_click(position);
             return Action::FocusMessages;
         }
@@ -611,12 +658,6 @@ impl App {
             return Action::EnterInsertMode;
         }
         Action::Tick
-    }
-
-    fn take_pending_terminal_bell(&mut self) -> bool {
-        let should_ring = self.pending_terminal_bell == TerminalBell::Pending;
-        self.pending_terminal_bell = TerminalBell::Idle;
-        should_ring
     }
 
     fn channel_has_unseen_messages(&self, channel_id: &str) -> bool {
@@ -642,14 +683,28 @@ impl App {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "central action dispatch keeps state transitions explicit"
+    )]
     pub fn update(&mut self, action: Action) {
         match action {
+            Action::OpenHelp => self.help_popup = Some(HelpPopup::default()),
+            Action::CloseHelp => self.help_popup = None,
             Action::Quit => self.should_quit = true,
             Action::EnterNormalMode => self.mode = Mode::Normal,
-            Action::EnterInsertMode => self.mode = Mode::Insert,
+            Action::EnterInsertMode if !self.activity_open => self.mode = Mode::Insert,
             Action::FocusSidebar => self.focus = Focus::Sidebar,
             Action::FocusMessages => self.focus = Focus::Messages,
             Action::OpenChannel => self.handle_open_channel(),
+            Action::OpenLatestNotification => self.handle_open_latest_notification(),
+            action @ (Action::OpenActivity
+            | Action::RefreshActivity
+            | Action::ReadActivity
+            | Action::OpenActivityThread(_)
+            | Action::ActivityLoaded(_)
+            | Action::ThreadReadFinished { .. }
+            | Action::ThreadOpenFailed { .. }) => self.handle_activity_action(action),
             Action::MarkAllRead => self.handle_mark_all_read(),
             Action::ToggleUnreadFilter => {
                 self.sidebar.filter_unread = !self.sidebar.filter_unread;
@@ -731,8 +786,7 @@ impl App {
                 self.handle_custom_emoji_loaded(&emoji_map);
             }
             Action::AuthValidated { user_id, user_name } => {
-                tracing::info!("Authenticated as {user_name}");
-                self.self_user_id = Some(user_id);
+                self.handle_auth_validated(user_id, &user_name);
             }
             Action::Error { context, message } => {
                 self.handle_error(context, message);
@@ -740,7 +794,7 @@ impl App {
             Action::Tick => {
                 self.poll_if_due();
             }
-            Action::Render => {}
+            Action::EnterInsertMode | Action::Render => {}
         }
     }
 
@@ -764,11 +818,6 @@ impl App {
                 {
                     self.input.insert_text(&text);
                 }
-            }
-            ErrorContext::ThreadOpen => {
-                self.status_message = Some(message);
-                self.pending_thread = None;
-                self.loading = false;
             }
             ErrorContext::ChannelLoad => {
                 self.status_message = Some(message);
@@ -1036,8 +1085,9 @@ impl App {
             return;
         };
         let channel_id = channel.id.clone();
-        let channel_name = self.sidebar.channel_label(channel);
+        let channel_name = self.sidebar.channel_label(channel).to_string();
         self.focus = Focus::Messages;
+        self.activity_open = false;
         // Cancel any in-flight thread fetch regardless of whether the
         // channel changed — re-opening the same channel while a thread
         // is loading should not drop into thread mode later.
@@ -1065,6 +1115,260 @@ impl App {
             // click on the channel name means "back to the channel".
             self.handle_close_thread();
         }
+    }
+
+    fn handle_open_latest_notification(&mut self) {
+        if let Some(target) = self.latest_notified_thread.clone() {
+            self.open_activity_thread(&target);
+            return;
+        }
+        let Some(channel_id) = self.latest_notified_channel.as_deref() else {
+            self.status_message = Some("No new-chat notification yet".into());
+            return;
+        };
+        if self.sidebar.select_channel(channel_id) {
+            self.mode = Mode::Normal;
+            self.handle_open_channel();
+        } else {
+            self.status_message = Some("Notified conversation is no longer available".into());
+        }
+    }
+
+    fn handle_auth_validated(&mut self, user_id: String, user_name: &str) {
+        tracing::info!("Authenticated as {user_name}");
+        match self
+            .store
+            .get_session(&format!("thread_activity/{user_id}"))
+        {
+            Ok(Some(saved)) if saved.len() <= 2 * 1024 * 1024 => {
+                if let Ok(mut inbox) = serde_json::from_str::<ActivityInbox>(&saved) {
+                    inbox.entries.truncate(MAX_ACTIVITY_ITEMS);
+                    self.activity.inbox = inbox;
+                }
+            }
+            Err(error) => tracing::warn!("Failed to restore Activity: {error}"),
+            _ => {}
+        }
+        self.self_user_id = Some(user_id);
+        self.refresh_activity();
+    }
+
+    fn handle_activity_action(&mut self, action: Action) {
+        match action {
+            Action::OpenActivity => {
+                self.activity_open = true;
+                self.mode = Mode::Normal;
+                self.focus = Focus::Messages;
+                self.reactions_popup = None;
+                self.reaction_picker = None;
+                self.link_picker = None;
+                if self.last_activity_poll.is_none() {
+                    self.refresh_activity();
+                }
+            }
+            Action::RefreshActivity => self.refresh_activity(),
+            Action::ReadActivity => {
+                if let Some(entry) = self.activity.selected_entry() {
+                    let target = entry.target.clone();
+                    let ts = entry.latest_ts.clone();
+                    self.mark_activity_read(target, ts, true);
+                }
+            }
+            Action::OpenActivityThread(target) => self.open_activity_thread(&target),
+            Action::ActivityLoaded(result) => self.activity_loaded(result),
+            Action::ThreadReadFinished { target, ts, result } => {
+                match result {
+                    Ok(()) => {
+                        self.activity.inbox.confirm_read(&target, &ts);
+                        self.persist_activity();
+                    }
+                    Err(error) => {
+                        self.status_message =
+                            Some(format!("Thread read locally; Slack sync failed: {error}"));
+                    }
+                }
+                self.start_thread_read();
+            }
+            Action::ThreadOpenFailed { target, message }
+                if self.current_channel_id.as_deref() == Some(&target.channel_id)
+                    && self.pending_thread.as_deref() == Some(&target.thread_ts) =>
+            {
+                self.status_message = Some(message);
+                self.pending_thread = None;
+                self.loading = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_activity(&mut self) {
+        if self.activity_request.is_some() {
+            return;
+        }
+        let Some(self_id) = self.self_user_id.clone() else {
+            return;
+        };
+        let client = self.slack.clone();
+        self.last_activity_poll = Some(Instant::now());
+        self.activity.refreshing = true;
+        let read_revision = self.activity.inbox.read_revision();
+        self.activity_request = Some(
+            async move {
+                let result = client
+                    .fetch_thread_activity(&self_id)
+                    .await
+                    .map(|mut snapshot| {
+                        snapshot.read_revision = read_revision;
+                        snapshot
+                    })
+                    .map_err(|error| format_error_chain("Could not refresh replies", &error));
+                Action::ActivityLoaded(result)
+            }
+            .boxed(),
+        );
+    }
+
+    fn activity_loaded(&mut self, result: Result<crate::activity::ActivitySnapshot, String>) {
+        self.activity.refreshing = false;
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.activity.error = Some(crate::activity::preview(&error));
+                return;
+            }
+        };
+        let alerts = self.activity.merge(snapshot);
+        self.persist_activity();
+        // One terminal alert per sweep; the badge retains every unread thread.
+        if let Some(target) = alerts.into_iter().find(|target| {
+            !(self.terminal_focused
+                && !self.activity_open
+                && self.messages.scroll_offset == 0
+                && self.current_channel_id.as_deref() == Some(&target.channel_id)
+                && self.messages.active_thread.as_deref() == Some(&target.thread_ts))
+        }) {
+            let channel = self
+                .sidebar
+                .channels
+                .iter()
+                .find(|channel| channel.id == target.channel_id);
+            let label = channel.map_or(target.channel_id.as_str(), |channel| {
+                self.sidebar.channel_label(channel)
+            });
+            self.pending_terminal_notification = Some(ChatNotification::thread_reply(
+                &target.channel_id,
+                label,
+                channel.is_some_and(|channel| channel.is_im == Some(true)),
+            ));
+            self.latest_notified_channel = Some(target.channel_id.clone());
+            self.latest_notified_thread = Some(target);
+        }
+        let users: Vec<_> = self
+            .activity
+            .inbox
+            .entries
+            .iter()
+            .flat_map(|entry| [&entry.root_user, &entry.reply_user])
+            .filter(|id| {
+                is_slack_user_id(id)
+                    && !self.messages.user_cache.contains_key(*id)
+                    && !self.requested_users.contains(*id)
+            })
+            .take(8)
+            .cloned()
+            .collect();
+        for user in users {
+            self.resolve_user(user);
+        }
+    }
+
+    fn persist_activity(&self) {
+        let Some(user_id) = &self.self_user_id else {
+            return;
+        };
+        let key = format!("thread_activity/{user_id}");
+        let result = serde_json::to_string(&self.activity.inbox)
+            .map_err(Report::from)
+            .and_then(|saved| self.store.set_session(&key, &saved));
+        if let Err(error) = result {
+            tracing::warn!("Failed to save Activity: {error}");
+        }
+    }
+
+    fn open_activity_thread(&mut self, target: &ThreadTarget) {
+        self.activity_open = false;
+        self.mode = Mode::Normal;
+        self.focus = Focus::Messages;
+        self.status_message = None;
+        self.sidebar.select_channel(&target.channel_id);
+        if self.current_channel_id.as_deref() != Some(&target.channel_id) {
+            let channel = self
+                .sidebar
+                .channels
+                .iter()
+                .find(|channel| channel.id == target.channel_id);
+            let name = channel
+                .map_or(target.channel_id.as_str(), |channel| {
+                    self.sidebar.channel_label(channel)
+                })
+                .to_string();
+            if let Some(previous) = self.current_channel_id.replace(target.channel_id.clone()) {
+                self.update_channel_unread(&previous);
+            }
+            self.messages.set_channel(Vec::new(), name);
+        }
+        self.pending_thread = None;
+        self.closing_thread = false;
+        self.load_reason = LoadReason::ThreadClose;
+        self.handle_open_thread(&target.thread_ts);
+    }
+
+    fn mark_activity_read(&mut self, target: ThreadTarget, ts: String, force: bool) {
+        if self
+            .activity
+            .inbox
+            .entries
+            .iter()
+            .any(|entry| entry.target == target && ts <= entry.server_read_ts)
+        {
+            return;
+        }
+        if !self.activity.inbox.mark_read(&target, &ts) && !force {
+            return;
+        }
+        self.persist_activity();
+        if let Some((_, queued_ts)) = self
+            .thread_read_queue
+            .iter_mut()
+            .find(|(queued, _)| *queued == target)
+        {
+            if ts > *queued_ts {
+                *queued_ts = ts;
+            }
+        } else if self.thread_read_queue.len() < MAX_ACTIVITY_ITEMS {
+            self.thread_read_queue.push_back((target, ts));
+        }
+        self.start_thread_read();
+    }
+
+    fn start_thread_read(&mut self) {
+        if self.thread_read_request.is_some() {
+            return;
+        }
+        let Some((target, ts)) = self.thread_read_queue.pop_front() else {
+            return;
+        };
+        let client = self.slack.clone();
+        self.thread_read_request = Some(
+            async move {
+                let result = client
+                    .mark_thread_read(&target, &ts)
+                    .await
+                    .map_err(|error| crate::activity::preview(&error.to_string()));
+                Action::ThreadReadFinished { target, ts, result }
+            }
+            .boxed(),
+        );
     }
 
     fn handle_mark_all_read(&mut self) {
@@ -1229,10 +1533,15 @@ impl App {
             return;
         }
         let read_marker_ts = self
-            .messages
-            .read_marker_ts()
-            .map(str::to_string)
-            .or_else(|| self.last_seen_ts.get(channel_id).cloned());
+            .activity
+            .inbox
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.target.channel_id == channel_id && entry.target.thread_ts == thread_ts
+            })
+            .map(|entry| std::cmp::max(&entry.local_read_ts, &entry.server_read_ts).clone())
+            .filter(|ts| !ts.is_empty());
         let is_opening_thread = self.pending_thread.as_deref() == Some(thread_ts);
         let is_stable_active_thread = self.pending_thread.is_none()
             && !self.closing_thread
@@ -1251,6 +1560,25 @@ impl App {
         }
         self.messages.set_read_marker_ts(read_marker_ts);
         self.loading = false;
+        if !self.activity_open
+            && (is_opening_thread || (self.terminal_focused && self.messages.scroll_offset == 0))
+            && let Some(ts) = self
+                .messages
+                .messages
+                .iter()
+                .map(|message| &message.ts)
+                .max()
+                .cloned()
+        {
+            self.mark_activity_read(
+                ThreadTarget {
+                    channel_id: channel_id.to_string(),
+                    thread_ts: thread_ts.to_string(),
+                },
+                ts,
+                false,
+            );
+        }
         self.resolve_missing_users();
         self.resolve_file_images();
     }
@@ -1276,7 +1604,7 @@ impl App {
             && let Some(ch) = self.sidebar.selected_channel()
         {
             let id = ch.id.clone();
-            let name = self.sidebar.channel_label(ch);
+            let name = self.sidebar.channel_label(ch).to_string();
             self.current_channel_id = Some(id.clone());
             self.messages.channel_name = name;
             self.loading = true;
@@ -1328,6 +1656,7 @@ impl App {
                 .insert(channel_id.to_string(), observed_ts.to_string());
         }
         let viewing_channel = self.terminal_focused
+            && !self.activity_open
             && self.current_channel_id.as_deref() == Some(channel_id)
             && self.messages.active_thread.is_none();
         if is_new
@@ -1336,7 +1665,18 @@ impl App {
             && !viewing_channel
             && self.channel_has_unseen_messages(channel_id)
         {
-            self.pending_terminal_bell = TerminalBell::Pending;
+            let channel = self.sidebar.channels.iter().find(|ch| ch.id == channel_id);
+            let label = channel.map_or(channel_id, |ch| self.sidebar.channel_label(ch));
+            self.pending_terminal_notification = Some(ChatNotification::new(
+                channel_id,
+                label,
+                channel.is_some_and(|ch| ch.is_im == Some(true)),
+            ));
+            // Slack conversation IDs are short. Keep this extra navigation
+            // target bounded even if an unexpected API response is oversized.
+            self.latest_notified_thread = None;
+            self.latest_notified_channel =
+                (channel_id.len() <= 128).then(|| channel_id.to_string());
         }
         self.update_channel_unread(channel_id);
 
@@ -1357,6 +1697,8 @@ impl App {
         // advance last_seen_ts — the user may not have seen the
         // newest messages.
         if self.loading
+            && self.pending_thread.is_none()
+            && self.messages.active_thread.is_none()
             && self.load_reason == LoadReason::ChannelOpen
             && let Some(ts) = newest_ts
         {
@@ -1441,6 +1783,12 @@ impl App {
         // conversations.history rate limit (~50/min).
         const BG_POLL_BATCH: usize = 3;
 
+        if self
+            .last_activity_poll
+            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(60))
+        {
+            self.refresh_activity();
+        }
         if self.last_poll.elapsed() < self.config.poll_interval() {
             return;
         }
@@ -1699,8 +2047,11 @@ impl App {
                     let _ = tx.send(Action::ThreadPollFailed);
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::Error {
-                        context: ErrorContext::ThreadOpen,
+                    let _ = tx.send(Action::ThreadOpenFailed {
+                        target: ThreadTarget {
+                            channel_id,
+                            thread_ts,
+                        },
                         message: format!("Failed to load thread: {e}"),
                     });
                 }
@@ -1928,6 +2279,206 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let store = Store::open_in_memory().expect("test store");
         App::new(config, tx, None, store).expect("test app")
+    }
+
+    #[test]
+    fn help_is_modal_preserves_context_and_allows_question_marks_in_drafts() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        app.current_channel_id = Some("C1".into());
+        app.messages.set_thread("1.0".into(), vec![msg("1.0")]);
+        app.input.insert_text("draft");
+
+        let open = app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert!(matches!(open, Action::OpenHelp));
+        app.update(open);
+        for code in [
+            KeyCode::Tab,
+            KeyCode::Left,
+            KeyCode::Char('i'),
+            KeyCode::Char('a'),
+        ] {
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                Action::Render
+            ));
+        }
+        assert!(matches!(app.handle_paste("ignored"), Action::Render));
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Action::Render
+        ));
+        let close = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(close, Action::CloseHelp));
+        app.update(close);
+        assert!(app.help_popup.is_none());
+        assert!(!app.should_quit);
+        assert_eq!(app.focus, Focus::Messages);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.current_channel_id.as_deref(), Some("C1"));
+        assert_eq!(app.messages.active_thread.as_deref(), Some("1.0"));
+        assert_eq!(app.input.get_text(), "draft");
+
+        app.update(Action::EnterInsertMode);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert_eq!(app.input.get_text(), "draft?");
+        assert!(app.help_popup.is_none());
+        app.update(Action::EnterNormalMode);
+        app.update(Action::OpenHelp);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn footer_keeps_help_visible_when_status_is_long() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = test_app();
+        app.status_message = Some("Long status message ".repeat(20));
+        for width in [20, 52, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).expect("terminal");
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let footer: String = (0..width)
+                .filter_map(|x| buffer.cell((x, 19)))
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(footer.ends_with(" ?:help "), "{footer}");
+            assert!(footer.starts_with(" NORMAL "), "{footer}");
+        }
+    }
+
+    fn activity_snapshot(
+        entries: Vec<crate::activity::ActivityEntry>,
+        now: &str,
+    ) -> crate::activity::ActivitySnapshot {
+        crate::activity::ActivitySnapshot {
+            entries,
+            complete: true,
+            started_ts: now.into(),
+            read_revision: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+    async fn activity_notifies_renders_and_opens_exact_thread() -> color_eyre::Result<()> {
+        use crate::activity::test_entry;
+        use ratatui::{Terminal, backend::TestBackend};
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), tx, None, Store::open_in_memory()?)?;
+        app.messages
+            .user_cache
+            .insert("UROOT".into(), "Alice".into());
+        app.messages
+            .user_cache
+            .insert("UOTHER".into(), "Bob".into());
+        app.self_user_id = Some("test".into());
+        app.sidebar.set_channels(two_channels());
+        app.update(Action::ActivityLoaded(Ok(activity_snapshot(
+            vec![],
+            "1700000100.000000",
+        ))));
+        let entry = test_entry("CARCHIVED", "1700000101.000000");
+        app.update(Action::ActivityLoaded(Ok(activity_snapshot(
+            vec![entry.clone()],
+            "1700000102.000000",
+        ))));
+        assert!(app.pending_terminal_notification.take().is_some());
+        assert_eq!(app.latest_notified_thread.as_ref(), Some(&entry.target));
+        assert!(app.store.get_session("thread_activity/test")?.is_some());
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.update(action);
+        app.update(Action::EnterInsertMode);
+        assert_eq!(app.mode, Mode::Normal);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20))?;
+        terminal.draw(|frame| crate::ui::render(frame, &mut app))?;
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("Activity · Replies"));
+        assert!(rendered.contains("Review is ready"));
+        assert!(app.panes.input.is_empty());
+        assert!(
+            matches!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::OpenActivityThread(target) if target == entry.target)
+        );
+
+        let (client, server) = reaction_test_server(vec![serde_json::json!({"ok":true,"messages":[{"ts":entry.target.thread_ts,"text":"Root"},{"ts":entry.latest_ts,"text":"Reply"}]}).to_string()]).await;
+        app.slack = client;
+        app.update(Action::OpenLatestNotification);
+        let action = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await?
+            .expect("thread result");
+        app.update(action);
+        assert!(!app.activity_open);
+        assert_eq!(app.current_channel_id.as_deref(), Some("CARCHIVED"));
+        assert_eq!(
+            app.messages.active_thread.as_deref(),
+            Some(entry.target.thread_ts.as_str())
+        );
+        assert_eq!(app.activity.inbox.unread_count(), 0);
+        assert!(app.thread_read_request.is_some());
+        let requests = server.await?;
+        assert!(
+            requests[0]
+                .0
+                .contains("channel=CARCHIVED&ts=1700000000.000001")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_errors_and_scrolled_thread_refresh_keep_unread_work() {
+        use crate::activity::test_entry;
+        let mut app = test_app();
+        app.messages
+            .user_cache
+            .insert("UROOT".into(), "Alice".into());
+        app.messages
+            .user_cache
+            .insert("UOTHER".into(), "Bob".into());
+        let entry = test_entry("CARCHIVED", "1700000101.000000");
+        app.update(Action::ActivityLoaded(Ok(activity_snapshot(
+            vec![entry.clone()],
+            "1700000102.000000",
+        ))));
+        app.update(Action::ActivityLoaded(Err("offline".into())));
+        assert_eq!(app.activity.inbox.unread_count(), 1);
+        assert_eq!(app.activity.error.as_deref(), Some("offline"));
+        app.current_channel_id = Some(entry.target.channel_id.clone());
+        app.pending_thread = Some("1700000001.000001".into());
+        app.loading = true;
+        app.update(Action::ThreadOpenFailed {
+            target: entry.target.clone(),
+            message: "stale".into(),
+        });
+        assert!(app.loading);
+        assert_eq!(app.pending_thread.as_deref(), Some("1700000001.000001"));
+        app.pending_thread = None;
+        app.messages
+            .set_thread(entry.target.thread_ts.clone(), Vec::new());
+        app.messages.scroll_offset = 5;
+        app.terminal_focused = true;
+        app.update(Action::ThreadRepliesLoaded {
+            channel_id: entry.target.channel_id,
+            thread_ts: entry.target.thread_ts,
+            messages: vec![msg(&entry.latest_ts)],
+        });
+        assert_eq!(app.activity.inbox.unread_count(), 1);
+        assert!(app.thread_read_request.is_none());
     }
 
     async fn reaction_test_server(
@@ -2336,8 +2887,12 @@ mod tests {
         app.pending_thread = Some("100.0".into());
         app.loading = true;
 
-        app.update(Action::Error {
-            context: ErrorContext::ThreadOpen,
+        app.current_channel_id = Some("C1".into());
+        app.update(Action::ThreadOpenFailed {
+            target: ThreadTarget {
+                channel_id: "C1".into(),
+                thread_ts: "100.0".into(),
+            },
             message: "Failed to load thread: boom".into(),
         });
 
@@ -2364,7 +2919,7 @@ mod tests {
         });
 
         assert!(!app.sidebar.unread_channels.contains("C_OTHER"));
-        assert!(!app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_none());
         assert_eq!(
             app.last_seen_ts.get("C_OTHER").map(String::as_str),
             Some("2.0")
@@ -2391,7 +2946,7 @@ mod tests {
         });
 
         assert!(app.sidebar.unread_channels.contains("C_OTHER"));
-        assert!(!app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_none());
         assert_eq!(
             app.last_seen_ts.get("C_OTHER").map(String::as_str),
             Some("1.0")
@@ -2418,7 +2973,7 @@ mod tests {
         });
 
         assert!(app.sidebar.unread_channels.contains("C_OTHER"));
-        assert!(!app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_none());
         assert_eq!(
             app.last_seen_ts.get("C_OTHER").map(String::as_str),
             Some("1.0")
@@ -2441,7 +2996,7 @@ mod tests {
         });
 
         assert!(app.sidebar.unread_channels.contains("C_OTHER"));
-        assert!(app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_some());
     }
 
     #[test]
@@ -2454,7 +3009,11 @@ mod tests {
                 messages: vec![msg(ts)],
                 is_background: true,
             });
-            assert_eq!(app.take_pending_terminal_bell(), expected, "timestamp {ts}");
+            assert_eq!(
+                app.pending_terminal_notification.take().is_some(),
+                expected,
+                "timestamp {ts}"
+            );
         }
     }
 
@@ -2468,13 +3027,82 @@ mod tests {
             is_background: true,
         });
         assert!(!app.sidebar.unread_channels.contains("C_OTHER"));
-        assert!(!app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_none());
         app.update(Action::MessagesLoaded {
             channel_id: "C_OTHER".into(),
             messages: vec![msg("1.0")],
             is_background: true,
         });
-        assert!(app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_some());
+    }
+
+    #[tokio::test]
+    async fn notification_names_and_opens_the_original_channel_or_dm() {
+        let (client, server) = reaction_test_server(vec![
+            r#"{"ok":true,"messages":[]}"#.into(),
+            r#"{"ok":true,"messages":[]}"#.into(),
+        ])
+        .await;
+        let mut app = test_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.action_tx = tx;
+        app.slack = client;
+        app.current_channel_id = Some("C1".into());
+        let mut channels = two_channels();
+        channels.push(Channel {
+            id: "D1".into(),
+            name: None,
+            is_channel: Some(false),
+            is_im: Some(true),
+            is_member: Some(true),
+            user: "U_ALICE".into(),
+        });
+        app.sidebar.set_channels(channels);
+        app.sidebar.update_dm_name("U_ALICE", "Alice");
+
+        for (id, label, is_dm) in [("C2", "random", false), ("D1", "Alice", true)] {
+            app.latest_ts.insert(id.into(), "1.0".into());
+            app.update(Action::MessagesLoaded {
+                channel_id: id.into(),
+                messages: vec![msg("2.0")],
+                is_background: true,
+            });
+            assert_eq!(
+                app.pending_terminal_notification.take(),
+                Some(ChatNotification::new(id, label, is_dm))
+            );
+            assert!(app.pending_terminal_notification.take().is_none());
+            app.sidebar.unread_channels.remove(id);
+            app.sidebar.filter_unread = true;
+            let action = app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+            assert!(matches!(action, Action::OpenLatestNotification));
+            app.update(action);
+            assert_eq!(app.current_channel_id.as_deref(), Some(id));
+            assert_eq!(
+                app.sidebar.selected_channel().map(|ch| ch.id.as_str()),
+                Some(id)
+            );
+            assert_eq!(app.focus, Focus::Messages);
+            let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("history response timeout")
+                .expect("history response");
+            assert!(
+                matches!(&loaded, Action::MessagesLoaded { channel_id, .. } if channel_id == id)
+            );
+            app.update(loaded);
+        }
+        let requests = server.await.expect("server task");
+        assert_eq!(requests.len(), 2);
+        for ((request, _), id) in requests.iter().zip(["C2", "D1"]) {
+            let path = request.split_whitespace().nth(1).expect("request path");
+            let url = reqwest::Url::parse(&format!("http://localhost{path}")).expect("history URL");
+            assert_eq!(url.path(), "/conversations.history");
+            assert!(
+                url.query_pairs()
+                    .any(|(key, value)| key == "channel" && value == id)
+            );
+        }
     }
 
     #[test]
@@ -2489,7 +3117,7 @@ mod tests {
                 messages: vec![msg(ts)],
                 is_background: true,
             });
-            assert_eq!(app.take_pending_terminal_bell(), !focused);
+            assert_eq!(app.pending_terminal_notification.take().is_some(), !focused);
         }
     }
 
@@ -2615,6 +3243,7 @@ mod tests {
 
         let mut app = test_app();
         app.panes = crate::ui::Panes {
+            activity: Rect::default(),
             sidebar: Rect::new(0, 0, 20, 20),
             messages: Rect::new(20, 0, 60, 15),
             input: Rect::new(20, 15, 60, 5),
@@ -2753,7 +3382,7 @@ mod tests {
             is_background: true,
         });
         assert!(app.sidebar.unread_channels.contains("C1"));
-        assert!(!app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_none());
         assert_eq!(
             app.last_seen_ts.get("C1").map(String::as_str),
             Some("100.000001")
@@ -2776,7 +3405,7 @@ mod tests {
         app.update(Action::OpenChannel);
 
         assert!(app.sidebar.unread_channels.contains("C1"));
-        assert!(!app.take_pending_terminal_bell());
+        assert!(app.pending_terminal_notification.take().is_none());
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::theme;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Panes {
     pub sidebar: Rect,
+    pub activity: Rect,
     pub messages: Rect,
     pub input: Rect,
 }
@@ -32,6 +33,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(main_area);
 
+    let [activity_area, sidebar_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(sidebar_area);
+
     // Grow input box to fit rendered content (visual rows + borders), capped at 8.
     let input_inner_width = right_area.width.saturating_sub(2);
     let input_height = app
@@ -46,18 +50,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(right_area);
 
+    let (messages_area, input_area) = if app.activity_open {
+        (right_area, Rect::default())
+    } else {
+        (messages_area, input_area)
+    };
     app.panes = Panes {
         sidebar: sidebar_area,
+        activity: activity_area,
         messages: messages_area,
         input: input_area,
     };
+    render_activity_button(frame, activity_area, app);
 
     app.sidebar
         .render(frame, sidebar_area, app.focus == Focus::Sidebar);
-    app.messages
-        .render(frame, messages_area, app.focus == Focus::Messages);
-    app.input
-        .render(frame, input_area, app.mode == Mode::Insert);
+    if app.activity_open {
+        app.activity.render(
+            frame,
+            messages_area,
+            app.focus == Focus::Messages,
+            &app.sidebar,
+            &app.messages.user_cache,
+        );
+    } else {
+        app.messages
+            .render(frame, messages_area, app.focus == Focus::Messages);
+        app.input
+            .render(frame, input_area, app.mode == Mode::Insert);
+    }
 
     if let Some(ref mut popup) = app.reactions_popup {
         popup.render(
@@ -75,19 +96,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     render_status_bar(frame, status_area, app);
+    if let Some(help) = app.help_popup.as_mut() {
+        help.render(frame, main_area);
+    }
+}
+
+fn render_activity_button(frame: &mut Frame, area: Rect, app: &App) {
+    let count = app.activity.inbox.unread_count();
+    let label = if count == 0 {
+        " Activity  a ".to_string()
+    } else {
+        format!(" Activity  ● {count}  a ")
+    };
+    let mut block = theme::panel_block(Line::default(), app.activity_open);
+    let mut style = if app.activity_open {
+        theme::selected()
+    } else {
+        theme::surface()
+    };
+    if count > 0 {
+        style = style.fg(theme::YELLOW).bold();
+        if !app.activity_open {
+            style = style.bg(theme::SURFACE_RAISED);
+            block = block.border_style(Style::default().fg(theme::YELLOW));
+        }
+    }
+    frame.render_widget(Paragraph::new(label).block(block).style(style), area);
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans: Vec<Span> = Vec::new();
-
-    spans.push(Span::styled(
-        " TOOY ",
-        Style::default()
-            .fg(theme::TEXT)
-            .bg(theme::SURFACE_RAISED)
-            .bold(),
-    ));
-
     let mode = match app.mode {
         Mode::Insert => Span::styled(
             " INSERT ",
@@ -98,28 +135,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::TEXT_MUTED).bg(theme::SURFACE),
         ),
     };
-    spans.push(mode);
-
-    let focus_label = match app.focus {
-        Focus::Sidebar => " nav ",
-        Focus::Messages => " history ",
-    };
-    spans.push(Span::styled(focus_label, theme::muted()));
-
-    if let Some(ref id) = app.current_channel_id {
-        let name = app.messages.channel_name.as_str();
-        if name.is_empty() {
-            spans.push(Span::styled(format!(" {id} "), theme::muted()));
-        } else {
-            spans.push(Span::styled(
-                format!(" #{name} "),
-                Style::default().fg(theme::BLUE).bg(theme::CANVAS),
-            ));
-        }
-        if app.messages.active_thread.is_some() {
-            spans.push(Span::styled(" thread ", Style::default().fg(theme::BLUE)));
-        }
-    }
+    let mut spans = vec![mode];
 
     if let Some(ref msg) = app.status_message {
         spans.push(Span::styled(
@@ -133,43 +149,42 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    let used: usize = spans.iter().map(Span::width).sum();
-    let remaining = (area.width as usize).saturating_sub(used);
-
-    let hints = if app.link_picker.is_some() {
-        "j/k:choose Enter:open Esc:cancel"
+    let (hints, compact) = if app.help_popup.is_some() {
+        ("↑/↓:scroll  Esc:close", "Esc:close")
+    } else if app.link_picker.is_some() {
+        ("Enter:open  Esc:cancel", "Esc:cancel")
     } else if app.reaction_picker.is_some() {
-        "type:search ↑/↓:choose Enter:add Esc:cancel"
+        ("Enter:add  Esc:cancel", "Esc:cancel")
     } else if app.reactions_popup.is_some() {
-        "Esc/q:close j/k:scroll"
+        ("↑/↓:scroll  Esc:close", "Esc:close")
+    } else if app.mode == Mode::Insert {
+        ("Enter:send  Esc:normal", "Esc:normal")
+    } else if app.activity_open && app.focus == Focus::Messages {
+        ("Enter:thread  ?:help", "?:help")
     } else {
-        match app.mode {
-            Mode::Insert if app.keyboard_enhanced => {
-                "Esc:normal Enter:send Opt/Shift+Enter:newline"
-            }
-            Mode::Insert => "Esc:normal Enter:send Opt+Enter/Ctrl+J:newline",
-            Mode::Normal => match app.focus {
-                Focus::Sidebar => {
-                    "q:quit i:insert Tab:history Enter:open R:read-all u:unread j/k:move"
-                }
-                Focus::Messages => {
-                    if app.messages.active_thread.is_some() {
-                        "q:quit i:reply h/Left:close R:react r:reactions o:open c:copy d:save J/K:msg j/k:line"
-                    } else {
-                        "q:quit i:insert Tab:nav l/Right:thread R:react r:reactions o:open c:copy d:save J/K:msg j/k:line"
-                    }
-                }
-            },
-        }
+        let hint = match app.focus {
+            Focus::Sidebar => "Enter:open  ?:help",
+            Focus::Messages if app.messages.active_thread.is_some() => "i:reply  ?:help",
+            Focus::Messages => "i:write  ?:help",
+        };
+        (hint, "?:help")
     };
-
-    let hint_width = UnicodeWidthStr::width(hints) + 2;
-    if remaining > hint_width {
-        let pad = remaining - hint_width;
-        spans.push(Span::from(" ".repeat(pad)));
-    }
-    spans.push(Span::styled(format!(" {hints} "), theme::muted()));
-
-    let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line).style(theme::canvas()), area);
+    let hints = if usize::from(area.width) < hints.width().saturating_add(12) {
+        compact
+    } else {
+        hints
+    };
+    let hint_width = u16::try_from(hints.width().saturating_add(2)).unwrap_or(u16::MAX);
+    let [status, shortcuts] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(hint_width)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::canvas()),
+        status,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {hints} "))
+            .right_aligned()
+            .style(theme::muted()),
+        shortcuts,
+    );
 }

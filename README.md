@@ -64,15 +64,45 @@ Images are detected automatically. Rex Beta uses colored half-block characters b
 
 ## Keybindings
 
+Press `?` in Normal mode for the complete, scrollable key reference. Use `j`/`k`,
+the arrow keys, or Page Up/Down to scroll; `Esc`, `?`, `q`, or `Enter` closes it.
+
 ### Global (Normal mode)
 
 | Key | Action |
 |-----|--------|
+| `?` | Open the keybinding reference |
 | `q` | Quit |
 | `i` | Enter insert mode |
 | `Esc` | Return to normal mode |
 | `Tab` | Switch focus between Channels and Messages |
 | `1` / `2` | Focus Channels / Messages directly |
+| `a` | Open Activity |
+| `N` | Open the most recently notified channel, DM, or thread |
+
+### Activity
+
+Activity shows replies in threads you follow or have participated in, including
+threads used in another Slack client. It refreshes every minute and keeps up to
+300 threads locally, retaining unread threads ahead of read history. On first
+use, a refresh establishes a notification baseline; later unread replies use the same
+bell and Rex notification support as channel messages. Opening a thread marks
+its displayed replies read in Slack. A failed read sync is reported in the status
+bar.
+
+This uses Slack's session thread API, tested with browser session credentials.
+If the configured token cannot access it, Activity shows an error and retry
+action. A limited result is labeled in the inbox.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move between threads |
+| `Enter` / `l` / Right | Open the selected thread |
+| `u` | Toggle unread-only filter |
+| `m` | Mark the selected thread read |
+| `r` | Refresh Activity |
+| `a` | Return to Activity from a thread |
+| `Tab` / `h` / Left | Focus Channels |
 
 ### Channels panel
 
@@ -115,14 +145,15 @@ Channels and Direct Messages start collapsed. Click a section header to toggle i
 | `Shift+Enter` | Insert newline (terminals with the kitty keyboard protocol — kitty, Ghostty, foot, WezTerm with `enable_kitty_keyboard=true`; elsewhere it sends) |
 | `/upload <path> [comment]` | Upload a local image/file to the current chat |
 | `Esc` | Return to normal mode |
-| Arrow keys | Move cursor |
-| `Home` / `End` | Move to start / end of line |
+| Left / Right | Move cursor |
+| `Home` / `End` | Move to start / end of draft |
 
 ### Mouse
 
 | Action | Effect |
 |--------|--------|
 | Click a channel | Open it |
+| Click Activity / a reply | Open Activity / its thread |
 | Click a section header | Collapse / expand the section |
 | Click a message | Select it |
 | Click the input box | Enter insert mode |
@@ -150,7 +181,8 @@ Logs are written to the same directory under `logs/app.log`. Pass `--debug` for 
 
 - Channel and DM navigation with unread indicators
 - Unread section at the top of the sidebar gathering channels/DMs with new messages
-- New-chat terminal bells and [OSC 7501 status](https://www.superlogical.com/rex/docs/build/program-status) for Rex status indicators and event handlers; returning to the app clears the notice
+- Activity inbox for followed thread replies, with unread filtering, read-state sync, and notifications
+- New-chat terminal bells and [OSC 7501 status](https://www.superlogical.com/rex/docs/build/program-status) with the channel or DM name for Rex notifications, status indicators, and event handlers. Returning to the app clears its status records; `N` opens the most recently notified conversation. Rex build 1101 opens the originating terminal when a notification is clicked, but does not return which notification was clicked to the TUI.
 - Threaded conversations
 - Message sending and replies
 - User avatar display (on terminals that support image protocols)
