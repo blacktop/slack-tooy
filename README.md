@@ -6,6 +6,26 @@ A terminal Slack TUI with vim-style keybindings.
 
 Requires Rust stable (latest).
 
+On macOS 26 or later, install Xcode 26 or later, then build and run the hardened
+executable and isolated image decoder together:
+
+```sh
+brew install just xcodegen
+just run
+```
+
+To build and install both signed executables into `~/.cargo/bin`:
+
+```sh
+just install
+```
+
+`just build` builds and signs without launching; `just check` runs the Rust
+formatting, lint, and test checks. Pass app arguments with `just -- run --debug`.
+The macOS recipes use `scripts/build-macos.sh` for native tests and signing.
+
+On other platforms:
+
 ```sh
 cargo install --path .
 ```
@@ -61,6 +81,12 @@ poll_interval_secs = 5         # how often to poll Slack for new messages (min 1
 All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and `SLACK_COOKIE` environment variables.
 
 Images are detected automatically. Rex Beta uses colored half-block characters because the tested client (build 1026) displays the image widget's Kitty Unicode placeholders as missing glyphs.
+
+On macOS, avatars and inline images are decoded by the separate signed helper
+under a deny-by-default Seatbelt profile compiled into the app. The app applies
+it automatically; no separate profile file or launch command is needed. Missing
+helpers leave image placeholders. See [the native decoder documentation](macos/README.md) for the
+limits, native tests, and remaining security boundaries.
 
 ## Keybindings
 

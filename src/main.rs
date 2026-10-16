@@ -7,6 +7,8 @@ mod config;
 mod download;
 mod emoji;
 mod event;
+mod image_decode;
+mod image_pipeline;
 mod logging;
 mod media_preview;
 mod message_links;

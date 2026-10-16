@@ -458,10 +458,37 @@ impl SlackClient {
         }
     }
 
-    pub async fn download_bytes(&self, url: &str) -> Result<Vec<u8>> {
+    pub async fn download_image_bytes(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
         let builder = self.client.get(url);
-        let resp = self.apply_auth_for_host(url, builder).send().await?;
-        Self::download_response_bytes(url, resp).await
+        let mut response = self
+            .apply_auth_for_host(url, builder)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if !response.status().is_success() {
+            bail!("Image download returned HTTP {}", response.status());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX))
+        {
+            bail!("Encoded image exceeds the download limit");
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
+            let Some(length) = data.len().checked_add(chunk.len()) else {
+                bail!("Encoded image size overflow");
+            };
+            if length > limit {
+                bail!("Encoded image exceeds the download limit");
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(data)
     }
 
     /// Message-authored URLs are untrusted even on slack.com: they could name
@@ -495,15 +522,6 @@ impl SlackClient {
         }
         out.flush().await?;
         Ok(())
-    }
-
-    async fn download_response_bytes(url: &str, resp: reqwest::Response) -> Result<Vec<u8>> {
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("HTTP error downloading {url}: {status}");
-        }
-        let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
     }
 }
 
@@ -615,5 +633,45 @@ mod tests {
                 authenticated
             );
         }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test fixtures")]
+    async fn image_downloads_enforce_declared_and_streamed_byte_limits() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let url = format!("http://{}/image", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                for response in [
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nimage",
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nimage\r\n0\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+                ] {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let mut stream = BufReader::new(stream);
+                    let mut bytes = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert!(stream.read_line(&mut line).await.expect("header") > 0);
+                        bytes += line.len();
+                        assert!(bytes < 8192);
+                        if line == "\r\n" { break; }
+                    }
+                    stream.get_mut().write_all(response.as_bytes()).await.expect("response");
+                }
+            }).await.expect("server timeout");
+        });
+        let client = SlackClient::new("test-token", "").expect("client");
+        assert!(client.download_image_bytes(&url, 4).await.is_err());
+        assert!(client.download_image_bytes(&url, 4).await.is_err());
+        assert_eq!(
+            client.download_image_bytes(&url, 4).await.expect("image"),
+            b"data"
+        );
+        server.await.expect("server");
     }
 }

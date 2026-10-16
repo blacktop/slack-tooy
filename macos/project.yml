@@ -1,0 +1,63 @@
+name: SlackTooyMedia
+options:
+  minimumXcodeGenVersion: 2.46.0
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: 26.0
+    SWIFT_VERSION: 6.0
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    OTHER_CODE_SIGN_FLAGS: "--identifier $(PRODUCT_BUNDLE_IDENTIFIER)"
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_ENHANCED_SECURITY: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    SWIFT_COMPILATION_MODE: wholemodule
+targets:
+  slack-tooy-image-decoder:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Shared
+      - path: Launcher
+      - path: LocalDecoder/LocalImageDecoder.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.blacktop.slack-tooy.image-decoder
+        CODE_SIGN_ENTITLEMENTS: ../packaging/macos/slack-tooy.entitlements
+  ImageDecoderTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Shared
+      - path: Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.blacktop.slack-tooy.media.tests
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_ENHANCED_SECURITY: NO
+        ENABLE_HARDENED_RUNTIME: NO
+  slack-tooy-sandbox-probe:
+    type: tool
+    platform: macOS
+    sources:
+      - path: SandboxProbe
+      - path: Launcher
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.blacktop.slack-tooy.sandbox-probe
+        CODE_SIGN_ENTITLEMENTS: ../packaging/macos/slack-tooy.entitlements
+schemes:
+  DecoderChecks:
+    build:
+      targets:
+        slack-tooy-image-decoder: all
+        slack-tooy-sandbox-probe: all
+        ImageDecoderTests: all
+  ImageDecoderTests:
+    build:
+      targets:
+        ImageDecoderTests: all
+    test:
+      targets:
+        - ImageDecoderTests

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use color_eyre::eyre::{Report, Result, WrapErr};
+use color_eyre::eyre::{Report, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use futures::FutureExt;
 use futures::future::{BoxFuture, OptionFuture};
@@ -22,6 +22,7 @@ use crate::components::sidebar::ChannelSidebar;
 use crate::components::{Component, EventResult};
 use crate::config::Config;
 use crate::event::{AppEvent, EventHandler};
+use crate::image_pipeline::{ImagePipeline, Target as ImageTarget};
 use crate::slack::client::SlackClient;
 use crate::slack::types::{Channel, SlackFile, SlackMessage, is_slack_user_id, mentioned_user_ids};
 use crate::store::Store;
@@ -127,6 +128,7 @@ pub struct App {
     reaction_request: Option<BoxFuture<'static, Action>>,
     browser_request: Option<BoxFuture<'static, Action>>,
     preview_request: Option<BoxFuture<'static, Action>>,
+    image_requests: ImagePipeline,
 
     pub slack: SlackClient,
     pub current_channel_id: Option<String>,
@@ -366,6 +368,7 @@ impl App {
             reaction_request: None,
             browser_request: None,
             preview_request: None,
+            image_requests: ImagePipeline::default(),
             slack,
             current_channel_id: None,
             action_tx,
@@ -437,6 +440,7 @@ impl App {
                     self.preview_request = None;
                     AppEvent::BackgroundAction(action)
                 }
+                Some(action) = self.image_requests.next() => AppEvent::BackgroundAction(action),
             };
             if matches!(
                 &event,
@@ -1477,7 +1481,17 @@ impl App {
         if let Some(url) = avatar_url
             && self.picker.is_some()
         {
-            self.download_avatar(user_id, url);
+            if self.image_requests.remaining_capacity() == 0 {
+                // The regular visible-user resolution pass will retry after
+                // backpressure clears. Keep the sidebar's resolved DM label.
+                self.messages.user_cache.remove(&user_id);
+                tracing::debug!("Avatar image deferred because the image queue is full");
+            } else if !self
+                .image_requests
+                .enqueue(&self.slack, ImageTarget::Avatar(user_id), &url)
+            {
+                tracing::debug!("Avatar image URL is invalid");
+            }
         }
     }
 
@@ -1812,11 +1826,17 @@ impl App {
                 let image_url = file.image_url()?.to_string();
                 Some((image_key, image_url))
             })
+            .take(self.image_requests.remaining_capacity())
             .collect::<Vec<_>>();
 
         for (image_key, image_url) in requests {
-            self.requested_file_images.insert(image_key.clone());
-            self.download_file_image(image_key, image_url);
+            if self.image_requests.enqueue(
+                &self.slack,
+                ImageTarget::File(image_key.clone()),
+                &image_url,
+            ) {
+                self.requested_file_images.insert(image_key);
+            }
         }
     }
 
@@ -2132,31 +2152,6 @@ impl App {
         });
     }
 
-    fn download_avatar(&self, user_id: String, url: String) {
-        let tx = self.action_tx.clone();
-        let client = self.slack.clone();
-        tokio::spawn(async move {
-            let data = match client.download_bytes(&url).await {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!("Failed to download avatar for {user_id}: {e}");
-                    return;
-                }
-            };
-            match decode_image(data).await {
-                Ok(image) => {
-                    let _ = tx.send(Action::AvatarDownloaded {
-                        user_id,
-                        image: Box::new(image),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to decode avatar for {user_id}: {e}");
-                }
-            }
-        });
-    }
-
     fn download_file(&self, file: SlackFile, dir: PathBuf) {
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
@@ -2170,33 +2165,6 @@ impl App {
                         context: ErrorContext::Download,
                         message: format_error_chain("Failed to download file", &e),
                     });
-                }
-            }
-        });
-    }
-
-    fn download_file_image(&self, image_key: String, url: String) {
-        let tx = self.action_tx.clone();
-        let client = self.slack.clone();
-        tokio::spawn(async move {
-            let data = match client.download_bytes(&url).await {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!("Failed to download file image {image_key}: {e}");
-                    let _ = tx.send(Action::FileImageFailed { image_key });
-                    return;
-                }
-            };
-            match decode_image(data).await {
-                Ok(image) => {
-                    let _ = tx.send(Action::FileImageDownloaded {
-                        image_key,
-                        image: Box::new(image),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to decode file image {image_key}: {e}");
-                    let _ = tx.send(Action::FileImageFailed { image_key });
                 }
             }
         });
@@ -2265,16 +2233,6 @@ impl App {
         // Share the URL map with the message renderer
         self.messages.custom_emoji_urls = self.custom_emoji_urls.clone();
     }
-}
-
-/// Decode on the blocking pool — a large image takes hundreds of ms,
-/// which would stall an async runtime worker (or the UI task, if
-/// decoded in `update()`).
-async fn decode_image(data: Vec<u8>) -> Result<image::DynamicImage> {
-    tokio::task::spawn_blocking(move || image::load_from_memory(&data))
-        .await
-        .wrap_err("Image decode task failed")?
-        .wrap_err("Failed to decode image")
 }
 
 fn unresolved_user_ids(
@@ -2427,6 +2385,42 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(app.input.get_text(), " ");
         assert!(app.preview_request.is_none());
+    }
+
+    #[test]
+    fn full_image_queue_leaves_visible_avatars_resolvable() {
+        let mut app = test_app();
+        app.picker = Some(Picker::halfblocks());
+        app.messages.set_channel(vec![msg("1.0")], "general".into());
+        while app.image_requests.remaining_capacity() > 0 {
+            assert!(app.image_requests.enqueue(
+                &app.slack,
+                ImageTarget::File("queued".into()),
+                "https://example.com/image.png"
+            ));
+        }
+        app.handle_user_resolved(
+            "U1".into(),
+            "Alice",
+            Some("https://example.com/avatar.png".into()),
+        );
+        assert_eq!(
+            unresolved_user_ids(&app.messages.messages, &app.messages.user_cache),
+            vec!["U1"]
+        );
+
+        app.image_requests = ImagePipeline::default();
+        let capacity = app.image_requests.remaining_capacity();
+        app.handle_user_resolved(
+            "U1".into(),
+            "Alice",
+            Some("https://example.com/avatar.png".into()),
+        );
+        assert_eq!(
+            app.messages.user_cache.get("U1").map(String::as_str),
+            Some("Alice")
+        );
+        assert_eq!(app.image_requests.remaining_capacity(), capacity - 1);
     }
 
     fn activity_snapshot(
