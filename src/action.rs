@@ -84,6 +84,8 @@ pub enum Action {
 
     // Save files attached to the selected message to disk
     DownloadFiles,
+    PreviewMedia,
+    PreviewFinished(Result<crate::media_preview::PreviewSummary, String>),
     // Copy message text with Slack link markup replaced by its destination
     CopyMessage,
     OpenMessageLink,

@@ -552,6 +552,7 @@ impl Component for MessageList {
 
             // -- Download files on the selected message --
             (KeyCode::Char('d'), false) => EventResult::Action(Action::DownloadFiles),
+            (KeyCode::Char(' '), false) => EventResult::Action(Action::PreviewMedia),
 
             // -- Copy the selected message text --
             (KeyCode::Char('c'), false) => EventResult::Action(Action::CopyMessage),

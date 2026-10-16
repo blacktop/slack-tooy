@@ -28,8 +28,6 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 arboard = { version = "3.6.1", default-features = false }
 linkify = "0.11"
 base64 = "0.22"
-
-[dev-dependencies]
 tempfile = "3"
 
 [lints.clippy]

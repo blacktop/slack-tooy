@@ -70,6 +70,10 @@ const SECTIONS: &[Section] = &[
             ("R / +", "Add a reaction"),
             ("c", "Copy the selected message with clean link URLs"),
             ("o", "Open a message link in your browser"),
+            (
+                "Space",
+                "Preview photos in Quick Look and videos in QuickTime",
+            ),
             ("d", "Save attached files to Downloads"),
         ],
     },

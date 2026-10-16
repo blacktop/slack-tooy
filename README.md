@@ -130,11 +130,19 @@ Channels and Direct Messages start collapsed. Click a section header to toggle i
 | `R` / `+` | Add a reaction to the selected message (type an emoji name, ↑/↓ or Tab to choose, Enter to add, Esc to cancel) |
 | `c` | Copy the selected message text with clean link URLs to the system clipboard |
 | `o` | Open a web link from the selected message (choose with `j`/`k` or arrows if there are several, Enter to open, Esc to cancel) |
+| `Space` | Preview attached photos/videos or direct media links in Quick Look / QuickTime Player on macOS |
 | `d` | Download files on the selected message to `~/Downloads` |
 | `Esc` | Close thread |
 | `g` / `G` | Scroll to top / bottom |
 | `Ctrl+u` / `Ctrl+d` | Page up / down |
 | `Ctrl+b` / `Ctrl+f` | Large scroll up / down |
+
+Media previews use full-size files when available and clean up their temporary
+downloads when Quick Look closes and the separate QuickTime Player instance quits
+(`⌘Q`). Up to 16 media URLs and 512 MiB are handled per preview. For video-hosting
+pages such as YouTube, use `o` to open the page.
+Slack attachments use the configured credentials; links pasted into message text
+are fetched without them.
 
 ### Insert mode
 

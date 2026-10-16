@@ -8,6 +8,7 @@ mod download;
 mod emoji;
 mod event;
 mod logging;
+mod media_preview;
 mod message_links;
 mod slack;
 mod store;

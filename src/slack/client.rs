@@ -464,6 +464,21 @@ impl SlackClient {
         Self::download_response_bytes(url, resp).await
     }
 
+    /// Message-authored URLs are untrusted even on slack.com: they could name
+    /// API endpoints. Only file-object URLs receive the host-scoped credentials.
+    pub(crate) fn media_request(
+        &self,
+        url: &reqwest::Url,
+        from_file_metadata: bool,
+    ) -> reqwest::RequestBuilder {
+        let builder = self.client.get(url.clone()).timeout(FILE_TRANSFER_TIMEOUT);
+        if from_file_metadata {
+            self.apply_auth_for_host(url.as_str(), builder)
+        } else {
+            builder
+        }
+    }
+
     /// Download streamed straight to `out` so large files never
     /// buffer fully in memory.
     pub async fn download_to(&self, url: &str, out: &mut tokio::fs::File) -> Result<()> {
@@ -537,7 +552,7 @@ fn push_urlencoded_component(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::slack::client::{is_slack_host, urlencoded_body};
+    use crate::slack::client::{SlackClient, is_slack_host, urlencoded_body};
 
     #[test]
     fn urlencoded_body_encodes_spaces_punctuation_and_utf8() {
@@ -559,5 +574,46 @@ mod tests {
         assert!(!is_slack_host("https://notslack.com/x"));
         assert!(!is_slack_host("https://files.slack.com.evil.com/x"));
         assert!(!is_slack_host("not a url"));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test fixtures")]
+    fn media_requests_authenticate_only_slack_file_metadata() {
+        let client = SlackClient::new("test-token", "test-cookie").expect("client");
+        for (url, from_file_metadata, authenticated) in [
+            ("https://slack.com/api/conversations.history", false, false),
+            (
+                "https://files.slack.com/files-pri/T1-F1/cat.png",
+                false,
+                false,
+            ),
+            (
+                "https://files.slack.com/files-pri/T1-F1/cat.png",
+                true,
+                true,
+            ),
+            (
+                "http://files.slack.com/files-pri/T1-F1/cat.png",
+                true,
+                false,
+            ),
+            ("https://example.com/cat.png", true, false),
+        ] {
+            let url = reqwest::Url::parse(url).expect("URL");
+            let request = client
+                .media_request(&url, from_file_metadata)
+                .build()
+                .expect("request");
+            assert_eq!(
+                request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION),
+                authenticated
+            );
+            assert_eq!(
+                request.headers().contains_key(reqwest::header::COOKIE),
+                authenticated
+            );
+        }
     }
 }

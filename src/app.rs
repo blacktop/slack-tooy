@@ -126,6 +126,7 @@ pub struct App {
     /// The pending mutation is polled by the UI loop so its result is observed.
     reaction_request: Option<BoxFuture<'static, Action>>,
     browser_request: Option<BoxFuture<'static, Action>>,
+    preview_request: Option<BoxFuture<'static, Action>>,
 
     pub slack: SlackClient,
     pub current_channel_id: Option<String>,
@@ -364,6 +365,7 @@ impl App {
             help_popup: None,
             reaction_request: None,
             browser_request: None,
+            preview_request: None,
             slack,
             current_channel_id: None,
             action_tx,
@@ -429,6 +431,10 @@ impl App {
                 }
                 Some(action) = OptionFuture::from(self.browser_request.as_mut()) => {
                     self.browser_request = None;
+                    AppEvent::BackgroundAction(action)
+                }
+                Some(action) = OptionFuture::from(self.preview_request.as_mut()) => {
+                    self.preview_request = None;
                     AppEvent::BackgroundAction(action)
                 }
             };
@@ -716,6 +722,17 @@ impl App {
             Action::CloseThread => self.handle_close_thread(),
             Action::SendMessage => self.handle_send_message(),
             Action::DownloadFiles => self.handle_download_files(),
+            Action::PreviewMedia => self.handle_preview_media(),
+            Action::PreviewFinished(result) => {
+                self.status_message = Some(match result {
+                    Ok(summary) if summary.unavailable > 0 => format!(
+                        "Previewed {} item(s); {} unavailable",
+                        summary.files, summary.unavailable
+                    ),
+                    Ok(_) => "Media preview closed".into(),
+                    Err(error) => format!("Media preview failed: {error}"),
+                });
+            }
             Action::CopyMessage => self.handle_copy_message(),
             Action::OpenMessageLink => self.handle_open_message_link(),
             Action::CloseLinkPicker => self.link_picker = None,
@@ -915,6 +932,33 @@ impl App {
                 self.status_message = None;
             }
         }
+    }
+
+    fn handle_preview_media(&mut self) {
+        if self.preview_request.is_some() {
+            self.status_message =
+                Some("Close Quick Look or quit the preview's QuickTime instance first".into());
+            return;
+        }
+        let Some(text) = self.messages.selected_message_text() else {
+            self.status_message = Some("No message selected".into());
+            return;
+        };
+        let sources = crate::media_preview::sources(self.messages.selected_message_files(), text);
+        if sources.is_empty() {
+            self.status_message =
+                Some("Selected message has no photos, videos, or web links".into());
+            return;
+        }
+        let client = self.slack.clone();
+        self.status_message = Some("Opening media preview...".into());
+        self.preview_request =
+            Some(
+                async move {
+                    Action::PreviewFinished(crate::media_preview::open(client, sources).await)
+                }
+                .boxed(),
+            );
     }
 
     fn open_url(&mut self, url: reqwest::Url) {
@@ -2355,6 +2399,34 @@ mod tests {
             assert!(footer.ends_with(" ?:help "), "{footer}");
             assert!(footer.starts_with(" NORMAL "), "{footer}");
         }
+    }
+
+    #[test]
+    fn space_previews_the_selected_message_and_stays_text_in_insert_mode() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(action, Action::PreviewMedia));
+        app.update(action);
+        assert!(app.preview_request.is_none());
+
+        let mut message = msg("100.1");
+        message.text = "https://example.com/image.png".into();
+        app.messages.set_channel(vec![message], "general".into());
+        app.update(Action::PreviewMedia);
+        assert!(app.preview_request.is_some());
+        app.messages.set_channel(vec![], "other".into());
+        app.update(Action::PreviewMedia);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Close Quick Look or quit the preview's QuickTime instance first")
+        );
+        drop(app.preview_request.take());
+
+        app.update(Action::EnterInsertMode);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(app.input.get_text(), " ");
+        assert!(app.preview_request.is_none());
     }
 
     fn activity_snapshot(
