@@ -41,6 +41,8 @@ pub struct MessageList {
     pub file_image_protocols: HashMap<String, StatefulProtocol>,
     pub custom_emoji_urls: HashMap<String, String>,
     pub active_thread: Option<String>,
+    /// Visual unread boundary. Refreshes preserve it; explicit acknowledgement
+    /// advances it to the newest displayed message.
     read_marker_ts: Option<String>,
     line_cache: Option<(usize, Vec<VisualLine>)>,
     /// One-shot request to scroll the selected message into view on
@@ -127,6 +129,24 @@ impl MessageList {
     pub fn set_read_marker_ts(&mut self, read_marker_ts: Option<String>) {
         self.read_marker_ts = read_marker_ts;
         self.line_cache = None;
+    }
+
+    pub fn initialize_read_marker_ts(&mut self, read_marker_ts: Option<String>) {
+        if self.read_marker_ts.is_none() {
+            self.set_read_marker_ts(read_marker_ts);
+        }
+    }
+
+    pub fn acknowledge_read_marker(&mut self) {
+        let newest = self
+            .messages
+            .iter()
+            .map(|message| &message.ts)
+            .max()
+            .cloned();
+        if newest > self.read_marker_ts {
+            self.set_read_marker_ts(newest);
+        }
     }
 
     /// Number of messages in display order.
@@ -1351,7 +1371,7 @@ mod tests {
             let img = image::DynamicImage::new_rgb8(1, 1);
             let evicted = list.insert_file_image(format!("k{i}"), picker.new_resize_protocol(img));
             if i < crate::components::messages::MAX_FILE_IMAGES {
-                assert!(evicted.is_empty());
+                assert_eq!(evicted, Vec::<String>::new());
             } else {
                 assert_eq!(evicted, vec!["k0".to_string()]);
             }

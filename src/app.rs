@@ -703,9 +703,17 @@ impl App {
             Action::CloseHelp => self.help_popup = None,
             Action::Quit => self.should_quit = true,
             Action::EnterNormalMode => self.mode = Mode::Normal,
-            Action::EnterInsertMode if !self.activity_open => self.mode = Mode::Insert,
+            Action::EnterInsertMode if !self.activity_open => {
+                self.mode = Mode::Insert;
+                self.messages.acknowledge_read_marker();
+            }
             Action::FocusSidebar => self.focus = Focus::Sidebar,
-            Action::FocusMessages => self.focus = Focus::Messages,
+            Action::FocusMessages => {
+                self.focus = Focus::Messages;
+                if !self.activity_open {
+                    self.messages.acknowledge_read_marker();
+                }
+            }
             Action::OpenChannel => self.handle_open_channel(),
             Action::OpenLatestNotification => self.handle_open_latest_notification(),
             action @ (Action::OpenActivity
@@ -1421,6 +1429,9 @@ impl App {
 
     fn handle_mark_all_read(&mut self) {
         self.sidebar.mark_all_read();
+        if self.messages.active_thread.is_none() {
+            self.messages.acknowledge_read_marker();
+        }
         // Persist for channels with known timestamps — one transaction
         // so the event loop isn't stalled by a WAL sync per channel.
         for (ch_id, ts) in &self.latest_ts {
@@ -1613,10 +1624,11 @@ impl App {
         if is_opening_thread {
             self.pending_thread = None;
             self.messages.set_thread(thread_ts.to_string(), messages);
+            self.messages.set_read_marker_ts(read_marker_ts);
         } else {
             self.messages.refresh_messages(messages);
+            self.messages.initialize_read_marker_ts(read_marker_ts);
         }
-        self.messages.set_read_marker_ts(read_marker_ts);
         self.loading = false;
         if !self.activity_open
             && (is_opening_thread || (self.terminal_focused && self.messages.scroll_offset == 0))
@@ -1781,10 +1793,11 @@ impl App {
         if self.loading {
             let name = self.messages.channel_name.clone();
             self.messages.set_channel(messages, name);
+            self.messages.set_read_marker_ts(read_marker_ts);
         } else {
             self.messages.refresh_messages(messages);
+            self.messages.initialize_read_marker_ts(read_marker_ts);
         }
-        self.messages.set_read_marker_ts(read_marker_ts);
         self.loading = false;
 
         self.resolve_missing_users();
@@ -2281,6 +2294,22 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let store = Store::open_in_memory().expect("test store");
         App::new(config, tx, None, store).expect("test app")
+    }
+
+    fn rendered_app(app: &mut App) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).expect("terminal");
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]
@@ -2855,6 +2884,165 @@ mod tests {
 
         assert_eq!(app.messages.messages.len(), 1);
         assert!(!app.loading);
+    }
+
+    #[test]
+    fn unread_divider_survives_refresh_and_scrolling_until_a_pane_click() {
+        let history: Vec<_> = (1..=20)
+            .rev()
+            .map(|index| msg(&format!("1700000000.{index:06}")))
+            .collect();
+
+        for composer in [false, true] {
+            let mut app = test_app();
+            app.config.poll_interval_secs = u64::MAX;
+            app.sidebar.set_channels(two_channels());
+            app.current_channel_id = Some("C1".into());
+            app.messages.channel_name = "general".into();
+            app.messages.user_cache.insert("U1".into(), "Alice".into());
+            app.last_seen_ts
+                .insert("C1".into(), "1700000000.000002".into());
+            app.last_activity_poll = Some(Instant::now());
+            app.update(Action::OpenChannel);
+            let refresh = Action::MessagesLoaded {
+                channel_id: "C1".into(),
+                messages: history.clone(),
+                is_background: false,
+            };
+            app.update(refresh.clone());
+            assert_eq!(
+                app.last_seen_ts.get("C1").map(String::as_str),
+                Some("1700000000.000020")
+            );
+            assert!(!rendered_app(&mut app).contains("New Message"));
+
+            app.update(Action::Tick);
+            app.update(refresh.clone());
+            let scroll = app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: app.panes.messages.x + 1,
+                row: app.panes.messages.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.update(scroll);
+            let scroll = app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+            app.update(scroll);
+            assert!(rendered_app(&mut app).contains("New Messages"));
+
+            let pane = if composer {
+                app.panes.input
+            } else {
+                app.panes.messages
+            };
+            let click = app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: pane.x + 1,
+                row: pane.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.update(click);
+            assert!(!rendered_app(&mut app).contains("New Message"));
+            app.update(refresh);
+            assert!(!rendered_app(&mut app).contains("New Message"));
+        }
+    }
+
+    #[test]
+    fn later_arrivals_create_a_new_unread_divider_after_acknowledgement() {
+        for thread in [false, true] {
+            let mut app = test_app();
+            let entry = crate::activity::test_entry("C1", "1700000000.000002");
+            app.current_channel_id = Some("C1".into());
+            app.messages.user_cache.insert("U1".into(), "Alice".into());
+            app.last_seen_ts
+                .insert("C1".into(), entry.target.thread_ts.clone());
+            if thread {
+                app.pending_thread = Some(entry.target.thread_ts.clone());
+                app.activity.inbox.entries.push(entry.clone());
+            }
+            let refresh = |newest| {
+                let mut messages: Vec<_> = (1..=newest)
+                    .map(|index| msg(&format!("1700000000.{index:06}")))
+                    .collect();
+                if thread {
+                    Action::ThreadRepliesLoaded {
+                        channel_id: "C1".into(),
+                        thread_ts: entry.target.thread_ts.clone(),
+                        messages,
+                    }
+                } else {
+                    messages.reverse();
+                    Action::MessagesLoaded {
+                        channel_id: "C1".into(),
+                        messages,
+                        is_background: false,
+                    }
+                }
+            };
+            app.update(refresh(2));
+            if thread {
+                assert_eq!(app.activity.inbox.unread_count(), 0);
+            }
+            assert!(rendered_app(&mut app).contains("New Message"));
+            app.update(refresh(2));
+            assert!(rendered_app(&mut app).contains("New Message"));
+            let compose = app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+            app.update(compose);
+            assert!(!rendered_app(&mut app).contains("New Message"));
+            app.update(refresh(2));
+            assert!(!rendered_app(&mut app).contains("New Message"));
+            app.update(refresh(1));
+            app.update(Action::FocusMessages);
+            app.update(refresh(3));
+            let rendered = rendered_app(&mut app);
+            assert!(rendered.contains("New Message"));
+            assert!(!rendered.contains("New Messages"));
+        }
+    }
+
+    #[test]
+    fn unread_divider_initializes_when_open_captured_no_marker() {
+        for failed_load in [false, true] {
+            let mut app = test_app();
+            app.current_channel_id = Some("C1".into());
+            app.messages.user_cache.insert("U1".into(), "Alice".into());
+            if failed_load {
+                app.last_seen_ts.insert("C1".into(), "1.0".into());
+                app.update(Action::Error {
+                    context: ErrorContext::ChannelLoad,
+                    message: "offline".into(),
+                });
+            } else {
+                app.update(Action::MessagesLoaded {
+                    channel_id: "C1".into(),
+                    messages: vec![msg("1.0")],
+                    is_background: false,
+                });
+                assert!(!rendered_app(&mut app).contains("New Message"));
+            }
+            app.update(Action::MessagesLoaded {
+                channel_id: "C1".into(),
+                messages: vec![msg("2.0"), msg("1.0")],
+                is_background: false,
+            });
+            assert!(rendered_app(&mut app).contains("New Message"));
+        }
+    }
+
+    #[test]
+    fn mark_all_read_acknowledges_the_visible_channel_divider() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C1".into());
+        app.messages.user_cache.insert("U1".into(), "Alice".into());
+        app.last_seen_ts.insert("C1".into(), "1.0".into());
+        app.update(Action::MessagesLoaded {
+            channel_id: "C1".into(),
+            messages: vec![msg("2.0"), msg("1.0")],
+            is_background: false,
+        });
+        assert!(rendered_app(&mut app).contains("New Message"));
+        app.update(Action::MarkAllRead);
+        assert!(!rendered_app(&mut app).contains("New Message"));
     }
 
     #[test]

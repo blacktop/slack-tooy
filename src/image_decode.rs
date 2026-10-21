@@ -24,7 +24,7 @@ pub async fn decode(data: Vec<u8>) -> Result<DynamicImage> {
 fn sandbox_command(helper: &std::path::Path) -> Result<tokio::process::Command> {
     ensure!(
         helper.is_file(),
-        "Isolated image helper is missing; run scripts/build-macos.sh"
+        "Isolated image helper is missing; run just build"
     );
     let helper = helper
         .canonicalize()
@@ -226,7 +226,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    #[ignore = "requires the built macOS helper and an unsandboxed terminal; scripts/build-macos.sh runs it"]
+    #[ignore = "requires the built macOS helper and an unsandboxed terminal; just build runs it"]
     #[expect(clippy::expect_used, reason = "native test fixture")]
     async fn native_decoder_round_trip() {
         let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

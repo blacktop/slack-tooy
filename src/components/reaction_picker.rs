@@ -297,7 +297,7 @@ mod tests {
         let name = "a".repeat(MAX_NAME_BYTES);
         picker.insert_text(&format!(":{name}:suffix"));
         assert!(picker.selected_name().is_none());
-        assert!(picker.query.is_empty());
+        assert_eq!(picker.query, "");
 
         picker.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         picker.insert_text(":heart:");

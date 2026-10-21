@@ -22,7 +22,8 @@ just install
 
 `just build` builds and signs without launching; `just check` runs the Rust
 formatting, lint, and test checks. Pass app arguments with `just -- run --debug`.
-The macOS recipes use `scripts/build-macos.sh` for native tests and signing.
+The justfile owns the native tests and signing. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for release archives, Homebrew publishing, and maintainer setup.
 
 On other platforms:
 

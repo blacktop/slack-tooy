@@ -302,12 +302,14 @@ impl SlackClient {
                 Some(next) if next.len() <= 2048 && seen_cursors.insert(next.clone()) => {
                     cursor = next;
                 }
-                Some(_) => bail!("Thread pagination cursor did not advance"),
+                Some(_) => {
+                    bail!("Thread pagination cursor did not advance");
+                }
                 None => return Ok(all_messages),
             }
         }
 
-        bail!("Thread exceeds the 50-page limit")
+        bail!("Thread exceeds the 50-page limit");
     }
 
     pub async fn add_reaction(&self, channel_id: &str, message_ts: &str, name: &str) -> Result<()> {

@@ -425,7 +425,7 @@ mod tests {
             serde_json::from_str(json).expect("decode");
         assert_eq!(resp.data.messages.len(), 1);
         let msg = &resp.data.messages[0];
-        assert!(msg.text.is_empty());
+        assert_eq!(msg.text, "");
         assert_eq!(msg.files.len(), 1);
         assert_eq!(msg.files[0].name, "report.pdf");
         assert_eq!(msg.files[0].size, 2_621_440);
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(msg.reactions.len(), 2);
         assert_eq!(msg.reactions[0].count, 3);
         assert_eq!(msg.reactions[0].users, vec!["U2", "U3"]);
-        assert!(msg.reactions[1].users.is_empty());
+        assert_eq!(msg.reactions[1].users, Vec::<String>::new());
     }
 
     #[test]

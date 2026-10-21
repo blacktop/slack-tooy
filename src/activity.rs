@@ -223,10 +223,9 @@ mod tests {
     #[test]
     fn baseline_restart_and_reordered_older_items_do_not_ring() -> color_eyre::Result<()> {
         let mut inbox = ActivityInbox::default();
-        assert!(
-            inbox
-                .merge(snapshot(vec![], "1700000100.000000", true, 0))
-                .is_empty()
+        assert_eq!(
+            inbox.merge(snapshot(vec![], "1700000100.000000", true, 0)),
+            Vec::new()
         );
         let new = test_entry("C1", "1700000101.000000");
         assert_eq!(
@@ -234,15 +233,14 @@ mod tests {
             vec![new.target.clone()]
         );
         let mut restored: ActivityInbox = serde_json::from_str(&serde_json::to_string(&inbox)?)?;
-        assert!(
-            restored
-                .merge(snapshot(
-                    vec![new, test_entry("C2", "1700000099.000000")],
-                    "1700000103.000000",
-                    false,
-                    0
-                ))
-                .is_empty()
+        assert_eq!(
+            restored.merge(snapshot(
+                vec![new, test_entry("C2", "1700000099.000000")],
+                "1700000103.000000",
+                false,
+                0
+            )),
+            Vec::new()
         );
         assert_eq!(restored.unread_count(), 2);
         Ok(())
@@ -265,10 +263,9 @@ mod tests {
             vec![entry.target.clone()]
         );
         entry.latest_ts = "1700000105.000000".into();
-        assert!(
-            inbox
-                .merge(snapshot(vec![entry], "1700000106.000000", true, 0))
-                .is_empty()
+        assert_eq!(
+            inbox.merge(snapshot(vec![entry], "1700000106.000000", true, 0)),
+            Vec::new()
         );
     }
 

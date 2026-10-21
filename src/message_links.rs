@@ -251,7 +251,7 @@ mod tests {
         let input = "`<https://example.com/|sample>`\n\n```text\n<https://example.com/|sample>\n```\n<@U123> <#C123|general>";
         assert_eq!(render_text(input), input);
         assert_eq!(copy_text(input), input);
-        assert!(links(input).is_empty());
+        assert_eq!(links(input), Vec::<reqwest::Url>::new());
     }
 
     #[test]

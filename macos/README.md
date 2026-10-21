@@ -10,7 +10,7 @@ PNG, rejects source rasters over 16,384 pixels per edge or 64 million pixels,
 and emits thumbnails with a maximum edge of 2048 pixels.
 
 The profile denies operations by default. It allows the helper's executable,
-system framework reads, metadata queries, read-only sysctls, and existing pipe
+system framework reads, Apple's Rosetta runtime, metadata queries, read-only sysctls, and existing pipe
 I/O. Before applying the profile, the launcher uses Darwin's
 `POSIX_SPAWN_CLOEXEC_DEFAULT` to close inherited descriptors other than stdin,
 stdout, and stderr. It grants no network access or access to user-file contents. The Rust parent
@@ -18,7 +18,7 @@ limits encoded input and decoded output to 16 MiB, validates the response before
 allocating, and enforces a 15-second deadline and two concurrent image jobs.
 
 Use `just run` to build, test, sign, and launch the app, or `just build` to stop
-after building. These recipes call `scripts/build-macos.sh`. Both executables are
+after building. Both executables are
 placed in `target/release`; `just install` installs them together. Keep them beside
 one another when installing elsewhere. On macOS, missing or rejected helpers
 leave image placeholders rather than decoding untrusted files inside the TUI.

@@ -1,0 +1,63 @@
+version: 2
+project_name: slack-tooy
+dist: target/dist
+
+before:
+  hooks:
+    - just decoder
+
+builds:
+  - id: slack-tooy
+    builder: rust
+    command: build
+    binary: slack-tooy
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+    flags:
+      - --release
+      - --locked
+    env:
+      - MACOSX_DEPLOYMENT_TARGET=26.0
+    hooks:
+      post: 'just sign-binary "{{ .Path }}"'
+
+archives:
+  - id: slack-tooy
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - src: target/release/slack-tooy-image-decoder
+        dst: .
+        strip_parent: true
+
+checksum:
+  name_template: checksums.txt
+
+homebrew_casks:
+  - name: slack-tooy
+    ids:
+      - slack-tooy
+    binaries:
+      - slack-tooy
+      - slack-tooy-image-decoder
+    repository:
+      owner: blacktop
+      name: homebrew-tap
+      branch: master
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    skip_upload: auto
+    homepage: https://github.com/blacktop/slack-tooy
+    description: Terminal Slack client with vim-style keybindings
+    license: MIT
+    custom_block: |
+      depends_on macos: :tahoe
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/slack-tooy"]
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/slack-tooy-image-decoder"]
+        end
+      end

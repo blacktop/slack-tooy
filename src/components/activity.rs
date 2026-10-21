@@ -471,7 +471,7 @@ mod tests {
                     Action::OpenActivityThread(_)
                 ));
             } else {
-                assert!(view.last_rows.is_empty());
+                assert_eq!(view.last_rows, Vec::new());
             }
         }
         Ok(())

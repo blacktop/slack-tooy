@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn default_config_has_empty_token() {
         let config = Config::default();
-        assert!(config.slack_token.is_empty());
+        assert_eq!(config.slack_token, "");
         assert_eq!(config.sidebar_width, 3);
         assert_eq!(config.tick_rate_ms, 250);
     }
@@ -86,7 +86,7 @@ mod tests {
         let result = Config::load(Some(Path::new("/nonexistent/config.toml")));
         assert!(result.is_ok());
         let config = result.expect("should be ok");
-        assert!(config.slack_token.is_empty());
+        assert_eq!(config.slack_token, "");
     }
 
     #[test]

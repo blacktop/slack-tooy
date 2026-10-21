@@ -5,6 +5,7 @@
 (allow file-read-data file-map-executable
     (subpath "/System")
     (subpath "/usr/lib")
+    (literal "/Library/Apple/usr/libexec/oah/libRosettaRuntime")
     (literal "/")
     (literal (param "HELPER"))
     (literal "/dev/null")

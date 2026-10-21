@@ -556,7 +556,7 @@ mod tests {
             let mut sidebar = ChannelSidebar::new();
             sidebar.set_channels(vec![channel("C1", "alpha"), dm("D1", "U1")]);
             sidebar.filter_unread = true;
-            assert!(sidebar.visible_indices().is_empty());
+            assert_eq!(sidebar.visible_indices(), Vec::<usize>::new());
             assert!(sidebar.select_channel(id));
             assert!(sidebar.visible_indices().contains(&sidebar.selected));
             assert_eq!(
