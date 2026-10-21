@@ -1,245 +1,120 @@
 # slack-tooy
 
-A terminal Slack TUI with vim-style keybindings.
+A terminal Slack client with vim-style keys, channels, DMs, threads, reactions,
+and an Activity inbox for replies you might otherwise miss.
 
 ## Install
 
-Requires Rust stable (latest).
-
-On macOS 26 or later, install Xcode 26 or later, then build and run the hardened
-executable and isolated image decoder together:
+On macOS 26 or later, install from the [Homebrew tap](https://github.com/blacktop/homebrew-tap):
 
 ```sh
-brew install just xcodegen
-just run
+brew install --cask blacktop/tap/slack-tooy
 ```
 
-To build and install both signed executables into `~/.cargo/bin`:
+The cask installs the app and its image decoder. Each release also includes
+Apple Silicon and Intel archives on [GitHub](https://github.com/blacktop/slack-tooy/releases).
 
-```sh
-just install
-```
+## Set up Slack
 
-`just build` builds and signs without launching; `just check` runs the Rust
-formatting, lint, and test checks. Pass app arguments with `just -- run --debug`.
-The justfile owns the native tests and signing. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for release archives, Homebrew publishing, and maintainer setup.
-
-On other platforms:
-
-```sh
-cargo install --path .
-```
-
-Or run directly:
-
-```sh
-cargo run --release
-```
-
-## Authentication
-
-slack-tooy needs a Slack API token. Token precedence: CLI flag > config file > `SLACK_TOKEN` env var.
-
-### User/bot tokens (`xoxp-`, `xoxb-`)
-
-Set the token in the config file or pass it directly:
-
-```sh
-slack-tooy --token xoxp-your-token
-```
-
-### Browser session tokens (`xoxc-`)
-
-`xoxc-` tokens require a browser session cookie. To get both:
-
-1. Open Slack in your browser
-2. Open Developer Tools (F12)
-3. Go to Application > Cookies > `https://app.slack.com`
-4. Copy the `d` cookie value (starts with `xoxd-`)
-5. Go to Console, run `window.prompt("token", document.cookie.match(/(?:^|;\s*)xoxc[^;]+/)?.[0]?.split("=")[1])` and copy the token
-
-Then either set both in the config file or pass them:
-
-```sh
-slack-tooy --token xoxc-your-token --cookie xoxd-your-cookie
-```
-
-The cookie value can be passed with or without the `d=` prefix.
-
-## Configuration
-
-Config file location: `~/.config/slack-tooy/config.toml`
+Create `~/.config/slack-tooy/config.toml` with your Slack token:
 
 ```toml
 slack_token = "xoxp-your-token"
-cookie = ""                    # required for xoxc- tokens
-sidebar_width = 3              # 1-11, in 12-column grid units
-tick_rate_ms = 250             # UI refresh interval (min 50)
-poll_interval_secs = 5         # how often to poll Slack for new messages (min 1)
 ```
 
-All fields are optional. Token and cookie can also be set via `SLACK_TOKEN` and `SLACK_COOKIE` environment variables.
+Slack [user and bot tokens](https://docs.slack.dev/authentication/tokens) are
+supported. For a browser session, use an `xoxc-` token and its `d` cookie:
 
-Images are detected automatically. Rex Beta uses colored half-block characters because the tested client (build 1026) displays the image widget's Kitty Unicode placeholders as missing glyphs.
+```toml
+slack_token = "xoxc-your-token"
+cookie = "xoxd-your-cookie"
+```
 
-On macOS, avatars and inline images are decoded by the separate signed helper
-under a deny-by-default Seatbelt profile compiled into the app. The app applies
-it automatically; no separate profile file or launch command is needed. Missing
-helpers leave image placeholders. See [the native decoder documentation](macos/README.md) for the
-limits, native tests, and remaining security boundaries.
+You can find these in your browser's developer tools while signed into Slack:
+look for the token on a Slack API request in the Network tab, and the `d` cookie
+under Application → Cookies → `https://app.slack.com`. The cookie can include or
+omit the `d=` prefix.
 
-## Keybindings
+Then run:
 
-Press `?` in Normal mode for the complete, scrollable key reference. Use `j`/`k`,
-the arrow keys, or Page Up/Down to scroll; `Esc`, `?`, `q`, or `Enter` closes it.
+```sh
+slack-tooy
+```
 
-### Global (Normal mode)
+You can also use `--token` and `--cookie`, or the `SLACK_TOKEN` and `SLACK_COOKIE`
+environment variables. Command-line values take precedence over the config file,
+then environment variables. Use `--config <path>` for a different config file.
+
+## Using it
+
+Press `?` in Normal mode for the full, scrollable key reference. Press `Esc` to
+close it.
 
 | Key | Action |
-|-----|--------|
-| `?` | Open the keybinding reference |
-| `q` | Quit |
-| `i` | Enter insert mode |
-| `Esc` | Return to normal mode |
-| `Tab` | Switch focus between Channels and Messages |
-| `1` / `2` | Focus Channels / Messages directly |
+| --- | --- |
+| `Tab` | Switch between the sidebar and messages |
+| `j` / `k` | Navigate or scroll |
+| `Enter` | Open the selected channel or thread |
+| `J` / `K` | Select the next or previous message |
+| `i` | Write a message; `Enter` sends it |
+| `Alt+Enter` / `Ctrl+j` | Add a newline |
+| `Esc` | Leave the composer or close a thread |
 | `a` | Open Activity |
-| `N` | Open the most recently notified channel, DM, or thread |
+| `N` | Open the latest notified conversation |
+| `+` | Add a reaction in the messages panel |
+| `c` / `o` | Copy the selected message / open its links |
+| `Space` / `d` | Preview media on macOS / download attached files |
+| `q` | Quit |
 
-### Activity
+Channels and Direct Messages start collapsed. Click a heading to expand it, or
+press `Z` in the sidebar to expand everything. New messages appear in Unread.
+The red new-message divider stays in place while you scroll; clicking the chat
+or composer acknowledges it.
 
-Activity shows replies in threads you follow or have participated in, including
-threads used in another Slack client. It refreshes every minute and keeps up to
-300 threads locally, retaining unread threads ahead of read history. On first
-use, a refresh establishes a notification baseline; later unread replies use the same
-bell and Rex notification support as channel messages. Opening a thread marks
-its displayed replies read in Slack. A failed read sync is reported in the status
-bar.
+Activity shows replies to threads you follow or have participated in, including
+threads opened in another Slack client. It uses Slack's session thread API and
+works with browser session credentials. New replies trigger the same terminal
+bell and named Rex notifications as new channel messages. If your token cannot
+access Activity, the inbox shows the error and lets you retry.
 
-This uses Slack's session thread API, tested with browser session credentials.
-If the configured token cannot access it, Activity shows an error and retry
-action. A limited result is labeled in the inbox.
+In the composer, use `/upload <path> [comment]` to share a file. On macOS,
+`Space` opens images in Quick Look and videos in QuickTime Player. For pages such
+as YouTube, use `o` to open the browser. To select terminal text with the mouse,
+hold your terminal's selection modifier, usually `Shift` or `Option`.
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Move between threads |
-| `Enter` / `l` / Right | Open the selected thread |
-| `u` | Toggle unread-only filter |
-| `m` | Mark the selected thread read |
-| `r` | Refresh Activity |
-| `a` | Return to Activity from a thread |
-| `Tab` / `h` / Left | Focus Channels |
+## Configuration
 
-### Channels panel
+These optional settings show the defaults:
 
-Channels and Direct Messages start collapsed. Click a section header to toggle it, or press `Z` to expand all sections.
-
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Move selection down / up |
-| `g` / `G` | Jump to first / last channel |
-| `z` / `Z` | Collapse current section / expand all sections |
-| `Enter` | Open channel |
-| `R` | Mark all channels as read |
-| `u` | Toggle unread-only filter |
-
-### Messages panel
-
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Scroll by line |
-| `J` / `K` | Jump to next / previous message |
-| `l` / Right | Open thread for selected message |
-| `h` / Left | Close thread |
-| `Enter` | Open thread (alias for `l`) |
-| `r` | Show who reacted to the selected message (Esc/`q`/`r` closes, `j`/`k` scrolls) |
-| `R` / `+` | Add a reaction to the selected message (type an emoji name, ↑/↓ or Tab to choose, Enter to add, Esc to cancel) |
-| `c` | Copy the selected message text with clean link URLs to the system clipboard |
-| `o` | Open a web link from the selected message (choose with `j`/`k` or arrows if there are several, Enter to open, Esc to cancel) |
-| `Space` | Preview attached photos/videos or direct media links in Quick Look / QuickTime Player on macOS |
-| `d` | Download files on the selected message to `~/Downloads` |
-| `Esc` | Close thread |
-| `g` / `G` | Scroll to top / bottom |
-| `Ctrl+u` / `Ctrl+d` | Page up / down |
-| `Ctrl+b` / `Ctrl+f` | Large scroll up / down |
-
-Media previews use full-size files when available and clean up their temporary
-downloads when Quick Look closes and the separate QuickTime Player instance quits
-(`⌘Q`). Up to 16 media URLs and 512 MiB are handled per preview. For video-hosting
-pages such as YouTube, use `o` to open the page.
-Slack attachments use the configured credentials; links pasted into message text
-are fetched without them.
-
-### Insert mode
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Send message |
-| `Alt+Enter` / `Ctrl+J` | Insert newline |
-| `Shift+Enter` | Insert newline (terminals with the kitty keyboard protocol — kitty, Ghostty, foot, WezTerm with `enable_kitty_keyboard=true`; elsewhere it sends) |
-| `/upload <path> [comment]` | Upload a local image/file to the current chat |
-| `Esc` | Return to normal mode |
-| Left / Right | Move cursor |
-| `Home` / `End` | Move to start / end of draft |
-
-### Mouse
-
-| Action | Effect |
-|--------|--------|
-| Click a channel | Open it |
-| Click Activity / a reply | Open Activity / its thread |
-| Click a section header | Collapse / expand the section |
-| Click a message | Select it |
-| Click the input box | Enter insert mode |
-| Scroll wheel over messages | Scroll history |
-| Scroll wheel over channels | Move selection |
-
-Mouse capture takes over the terminal's native text selection — hold `Shift`
-(most terminals) or `Option`/`Fn` (macOS Terminal.app/iTerm2) while dragging
-to select text normally.
-
-The reaction picker accepts names such as `:thumbsup:`, custom workspace emoji,
-and skin tones such as `thumbsup::skin-tone-4`. User and bot tokens need the
-[`reactions:write`](https://docs.slack.dev/reference/scopes/reactions.write/) scope.
-
-## Data storage
-
-slack-tooy stores session and read-state data in a SQLite database:
-
-- macOS: `~/Library/Application Support/slack-tooy/slack-tooy.db`
-- Linux: `~/.local/share/slack-tooy/slack-tooy.db`
-
-Logs are written to the same directory under `logs/app.log`. Pass `--debug` for verbose output.
-
-## Features
-
-- Channel and DM navigation with unread indicators
-- Unread section at the top of the sidebar gathering channels/DMs with new messages
-- Activity inbox for followed thread replies, with unread filtering, read-state sync, and notifications
-- New-chat terminal bells and [OSC 7501 status](https://www.superlogical.com/rex/docs/build/program-status) with the channel or DM name for Rex notifications, status indicators, and event handlers. Returning to the app clears its status records; `N` opens the most recently notified conversation. Rex build 1101 opens the originating terminal when a notification is clicked, but does not return which notification was clicked to the TUI.
-- Threaded conversations
-- Message sending and replies
-- User avatar display (on terminals that support image protocols)
-- Custom emoji rendering in reactions
-- Add emoji reactions to messages and thread replies
-- Unicode-aware text wrapping
-- Vim-style keybindings throughout
-- Session persistence (remembers last channel across restarts)
-
-## CLI options
-
+```toml
+sidebar_width = 3       # 1–11, in 12-column grid units
+tick_rate_ms = 250      # minimum 50
+poll_interval_secs = 5  # minimum 1
 ```
-Usage: slack-tooy [OPTIONS]
 
-Options:
-  -c, --config <CONFIG>  Path to config file
-  -t, --token <TOKEN>    Slack API token (overrides config file)
-      --cookie <COOKIE>  Browser session cookie for xoxc- tokens (the `d` value)
-  -d, --debug            Enable debug logging
-  -h, --help             Print help
-  -V, --version          Print version
+Session state and logs live under `~/Library/Application Support/slack-tooy` on
+macOS, or `~/.local/share/slack-tooy` on Linux. Use `--debug` for verbose logging
+and `--help` for all command-line options.
+
+On macOS, avatars and inline images are decoded in a separate signed process
+under an embedded Seatbelt sandbox. It starts automatically. See the
+[decoder documentation](macos/README.md) for its limits and security boundaries.
+
+## Build from source
+
+Use Rust stable, macOS 26 or later, and Xcode 26 or later:
+
+```sh
+git clone https://github.com/blacktop/slack-tooy.git
+cd slack-tooy
+brew install just xcodegen
+just install
 ```
+
+`just install` builds, tests, signs, and installs both executables in
+`~/.cargo/bin`. Use `just run` to build and launch, or `just check` for the Rust
+checks. On other platforms, run `cargo install --path .` from the checkout.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and release instructions.
 
 ## License
 
