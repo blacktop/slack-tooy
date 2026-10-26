@@ -96,6 +96,7 @@ Session state and logs live under `~/Library/Application Support/slack-tooy` on
 macOS, or `~/.local/share/slack-tooy` on Linux. Use `--debug` for verbose logging
 and `--help` for all command-line options.
 
+Image support is detected automatically, including Kitty graphics in current Rex.
 On macOS, avatars and inline images are decoded in a separate signed process
 under an embedded Seatbelt sandbox. It starts automatically. See the
 [decoder documentation](macos/README.md) for its limits and security boundaries.
