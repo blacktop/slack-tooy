@@ -288,14 +288,11 @@ impl MessageList {
             .map(|message| message.ts.as_str())
     }
 
-    /// Get the `thread_ts` for the currently selected message.
+    /// Thread the selected message belongs to. A message outside any
+    /// thread is the root of its own, so a first reply can start one.
     pub fn selected_message_thread_ts(&self) -> Option<&str> {
         let msg = self.selected_display_message()?;
-        if msg.reply_count.is_some_and(|count| count > 0) {
-            Some(msg.ts.as_str())
-        } else {
-            msg.thread_ts.as_deref()
-        }
+        Some(msg.thread_ts.as_deref().unwrap_or(msg.ts.as_str()))
     }
 
     /// Files attached to the currently selected message.
@@ -1262,6 +1259,42 @@ mod tests {
 
         list.select_prev_message();
         assert_eq!(list.selected_message_text(), Some("thread root"));
+    }
+
+    #[test]
+    fn enter_opens_a_thread_on_a_message_without_replies() {
+        use crate::action::Action;
+        use crate::components::{Component, EventResult};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut list = MessageList::new();
+        list.set_channel(vec![message("1.0", "U1", "hello")], "general".into());
+
+        let result = list.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            result,
+            EventResult::Action(Action::OpenThread(ts)) if ts == "1.0"
+        ));
+    }
+
+    #[test]
+    fn enter_on_a_reply_opens_its_parent_thread() {
+        use crate::action::Action;
+        use crate::components::{Component, EventResult};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut reply = message("2.0", "U2", "broadcast reply");
+        reply.thread_ts = Some("1.0".into());
+        let mut list = MessageList::new();
+        list.set_channel(vec![reply], "general".into());
+
+        let result = list.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            result,
+            EventResult::Action(Action::OpenThread(ts)) if ts == "1.0"
+        ));
     }
 
     #[test]
