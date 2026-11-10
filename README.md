@@ -58,6 +58,7 @@ close it.
 | `J` / `K` | Select the next or previous message |
 | `i` | Write a message; `Enter` sends it |
 | `Alt+Enter` / `Ctrl+j` | Add a newline |
+| `Ctrl+s` | In a thread, also send the next reply to the channel |
 | `Esc` | Leave the composer or close a thread |
 | `a` | Open Activity |
 | `N` | Open the latest notified conversation |

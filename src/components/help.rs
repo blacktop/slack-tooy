@@ -87,6 +87,10 @@ const SECTIONS: &[Section] = &[
                 "Insert a newline when supported by the terminal",
             ),
             ("Esc", "Return to Normal mode"),
+            (
+                "Ctrl+s",
+                "In a thread, also send the next reply to the channel",
+            ),
             ("← / →", "Move the cursor"),
             ("Home / End", "Move to the start / end of the draft"),
             ("Backspace / Delete", "Delete before / at the cursor"),

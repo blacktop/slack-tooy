@@ -327,15 +327,9 @@ impl SlackClient {
         channel_id: &str,
         text: &str,
         thread_ts: Option<&str>,
+        broadcast: bool,
     ) -> Result<Option<String>> {
-        let mut body = serde_json::json!({
-            "channel": channel_id,
-            "text": text,
-        });
-        if let Some(ts) = thread_ts {
-            body["thread_ts"] = serde_json::Value::String(ts.to_string());
-        }
-
+        let body = post_message_body(channel_id, text, thread_ts, broadcast);
         let data: PostMessageData = self.post("chat.postMessage", &body).await?;
         Ok(data.ts)
     }
@@ -529,6 +523,25 @@ impl SlackClient {
 
 /// True when `url` points at slack.com or a subdomain (files.slack.com,
 /// workspace-name.slack.com).  Anything else is treated as external.
+fn post_message_body(
+    channel_id: &str,
+    text: &str,
+    thread_ts: Option<&str>,
+    broadcast: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "channel": channel_id,
+        "text": text,
+    });
+    if let Some(ts) = thread_ts {
+        body["thread_ts"] = serde_json::Value::String(ts.to_string());
+        if broadcast {
+            body["reply_broadcast"] = serde_json::Value::Bool(true);
+        }
+    }
+    body
+}
+
 fn is_slack_host(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -572,7 +585,21 @@ fn push_urlencoded_component(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::slack::client::{SlackClient, is_slack_host, urlencoded_body};
+    use crate::slack::client::{SlackClient, is_slack_host, post_message_body, urlencoded_body};
+
+    #[test]
+    fn post_message_body_broadcasts_only_thread_replies() {
+        let reply = post_message_body("C1", "hi", Some("1.0"), true);
+        assert_eq!(reply["thread_ts"], "1.0");
+        assert_eq!(reply["reply_broadcast"], true);
+
+        let quiet_reply = post_message_body("C1", "hi", Some("1.0"), false);
+        assert!(quiet_reply.get("reply_broadcast").is_none());
+
+        let channel_message = post_message_body("C1", "hi", None, true);
+        assert!(channel_message.get("thread_ts").is_none());
+        assert!(channel_message.get("reply_broadcast").is_none());
+    }
 
     #[test]
     fn urlencoded_body_encodes_spaces_punctuation_and_utf8() {

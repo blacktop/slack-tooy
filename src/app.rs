@@ -162,6 +162,9 @@ pub struct App {
     /// Draft captured at send time, restored into the input if the
     /// send fails (unless the user typed something new meanwhile).
     in_flight_send_text: Option<String>,
+    /// Thread whose next reply is also sent to the channel.  Keyed by
+    /// thread so the choice never carries over to another thread.
+    broadcast_thread: Option<String>,
     /// Progress of the current `d`-key download batch, if any.
     download_batch: Option<DownloadBatch>,
     /// Lazily initialized system clipboard. Keeping the handle alive is
@@ -385,6 +388,7 @@ impl App {
             self_user_id: None,
             thread_poll_in_flight: false,
             in_flight_send_text: None,
+            broadcast_thread: None,
             download_batch: None,
             clipboard: None,
             panes: crate::ui::Panes::default(),
@@ -552,10 +556,30 @@ impl App {
     }
 
     fn handle_insert_key(&mut self, key: KeyEvent) -> Action {
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_reply_broadcast();
+            return Action::Tick;
+        }
         let result = self.input.handle_key(key);
         match result {
             EventResult::Action(action) => action,
             _ => Action::Tick,
+        }
+    }
+
+    /// Whether the reply being composed also goes to the channel.
+    pub fn broadcasts_reply(&self) -> bool {
+        self.broadcast_thread.is_some() && self.broadcast_thread == self.messages.active_thread
+    }
+
+    fn toggle_reply_broadcast(&mut self) {
+        if self.broadcasts_reply() {
+            self.broadcast_thread = None;
+        } else if self.messages.active_thread.is_some() {
+            self.broadcast_thread
+                .clone_from(&self.messages.active_thread);
+        } else {
+            self.status_message = Some("Open a thread to also send a reply to the channel".into());
         }
     }
 
@@ -1130,6 +1154,9 @@ impl App {
         // failure here would reset thread/channel state belonging to
         // whatever the user is doing now.  The 5s poll self-heals.
         if let Some(ts) = thread_ts {
+            if self.broadcast_thread.as_deref() == Some(ts) {
+                self.broadcast_thread = None;
+            }
             self.load_thread_replies_quiet(channel_id, ts);
         } else {
             self.load_messages_refresh(channel_id);
@@ -1520,7 +1547,15 @@ impl App {
         }
 
         let thread_ts = self.messages.active_thread.clone();
+        let broadcast = self.broadcasts_reply();
         let upload = match parse_upload_command(&text) {
+            Ok(Some(_)) if broadcast => {
+                self.status_message = Some(
+                    "Uploads cannot also be sent to the channel; press Ctrl+s to turn that off"
+                        .into(),
+                );
+                return;
+            }
             Ok(upload) => upload,
             Err(message) => {
                 self.status_message = Some(message);
@@ -1536,7 +1571,7 @@ impl App {
         if let Some(upload) = upload {
             self.upload_file(channel_id, upload, thread_ts);
         } else {
-            self.send_message(channel_id, text, thread_ts);
+            self.send_message(channel_id, text, thread_ts, broadcast);
         }
     }
 
@@ -2042,12 +2077,18 @@ impl App {
         });
     }
 
-    fn send_message(&self, channel_id: String, text: String, thread_ts: Option<String>) {
+    fn send_message(
+        &self,
+        channel_id: String,
+        text: String,
+        thread_ts: Option<String>,
+        broadcast: bool,
+    ) {
         let tx = self.action_tx.clone();
         let client = self.slack.clone();
         tokio::spawn(async move {
             match client
-                .post_message(&channel_id, &text, thread_ts.as_deref())
+                .post_message(&channel_id, &text, thread_ts.as_deref(), broadcast)
                 .await
             {
                 Ok(message_ts) => {
@@ -3116,6 +3157,75 @@ mod tests {
 
         assert_eq!(app.pending_sends, 0);
         assert_eq!(app.input.get_text(), "hello there");
+    }
+
+    fn ctrl_s() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_s_toggles_reply_broadcast_only_for_the_open_thread() {
+        let mut app = test_app();
+        app.mode = Mode::Insert;
+        app.messages.set_thread("1.0".into(), vec![msg("1.0")]);
+
+        app.handle_insert_key(ctrl_s());
+        assert!(app.broadcasts_reply());
+        assert_eq!(app.input.get_text(), "");
+
+        app.messages.set_thread("2.0".into(), vec![msg("2.0")]);
+        assert!(!app.broadcasts_reply());
+
+        app.handle_insert_key(ctrl_s());
+        app.handle_insert_key(ctrl_s());
+        assert!(!app.broadcasts_reply());
+    }
+
+    #[test]
+    fn ctrl_s_outside_a_thread_explains_instead_of_broadcasting() {
+        let mut app = test_app();
+        app.mode = Mode::Insert;
+
+        app.handle_insert_key(ctrl_s());
+
+        assert!(!app.broadcasts_reply());
+        assert!(app.status_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn sent_reply_turns_broadcast_off_but_failed_send_keeps_it() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C1".into());
+        app.messages.set_thread("1.0".into(), vec![msg("1.0")]);
+        app.handle_insert_key(ctrl_s());
+
+        app.update(Action::Error {
+            context: ErrorContext::Send,
+            message: "Failed to send: boom".into(),
+        });
+        assert!(app.broadcasts_reply());
+
+        app.update(Action::MessageSent {
+            channel_id: "C1".into(),
+            thread_ts: Some("1.0".into()),
+            message_ts: Some("3.0".into()),
+        });
+        assert!(!app.broadcasts_reply());
+    }
+
+    #[test]
+    fn upload_is_rejected_while_reply_broadcast_is_on() {
+        let mut app = test_app();
+        app.current_channel_id = Some("C1".into());
+        app.messages.set_thread("1.0".into(), vec![msg("1.0")]);
+        app.handle_insert_key(ctrl_s());
+        app.input.insert_text("/upload /tmp/cat.png");
+
+        app.update(Action::SendMessage);
+
+        assert_eq!(app.pending_sends, 0);
+        assert_eq!(app.input.get_text(), "/upload /tmp/cat.png");
+        assert!(app.broadcasts_reply());
     }
 
     #[test]

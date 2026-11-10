@@ -15,6 +15,8 @@ const PASTE_TAB_WIDTH: usize = 4;
 pub struct TextInput {
     text: Vec<char>,
     cursor_pos: usize,
+    /// Shown in the title while a thread reply also goes to the channel.
+    pub also_send_to_channel: bool,
 }
 
 impl TextInput {
@@ -22,6 +24,7 @@ impl TextInput {
         Self {
             text: Vec::new(),
             cursor_pos: 0,
+            also_send_to_channel: false,
         }
     }
 
@@ -171,7 +174,12 @@ impl Component for TextInput {
         } else {
             theme::muted()
         };
-        let title = Line::from(Span::styled(" composer ", title_style));
+        let title = if self.also_send_to_channel {
+            " composer · also to channel "
+        } else {
+            " composer "
+        };
+        let title = Line::from(Span::styled(title, title_style));
 
         // Pre-wrap with the same algorithm used for cursor math and
         // height sizing, so the drawn text, the box height, and the

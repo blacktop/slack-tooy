@@ -76,6 +76,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else {
         app.messages
             .render(frame, messages_area, app.focus == Focus::Messages);
+        app.input.also_send_to_channel = app.broadcasts_reply();
         app.input
             .render(frame, input_area, app.mode == Mode::Insert);
     }
@@ -157,6 +158,8 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         ("Enter:add  Esc:cancel", "Esc:cancel")
     } else if app.reactions_popup.is_some() {
         ("↑/↓:scroll  Esc:close", "Esc:close")
+    } else if app.mode == Mode::Insert && app.messages.active_thread.is_some() {
+        ("Enter:send  ^s:+channel  Esc:normal", "Esc:normal")
     } else if app.mode == Mode::Insert {
         ("Enter:send  Esc:normal", "Esc:normal")
     } else if app.activity_open && app.focus == Focus::Messages {
