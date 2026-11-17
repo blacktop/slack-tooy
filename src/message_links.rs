@@ -8,6 +8,7 @@ use reqwest::Url;
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_URL_BYTES: usize = 8192;
 const MAX_LINKS: usize = 128;
+const SLACK_FENCE: &str = "```";
 
 #[derive(Clone, Copy)]
 enum LinkFormat {
@@ -16,7 +17,36 @@ enum LinkFormat {
 }
 
 pub fn render_text(input: &str) -> Cow<'_, str> {
-    rewrite_slack_links(input, LinkFormat::Markdown)
+    match slack_code_blocks_to_markdown(input) {
+        Cow::Borrowed(text) => rewrite_slack_links(text, LinkFormat::Markdown),
+        Cow::Owned(markdown) => {
+            Cow::Owned(rewrite_slack_links(&markdown, LinkFormat::Markdown).into_owned())
+        }
+    }
+}
+
+/// Slack code blocks have no language tag, and their fences may share a line
+/// with the code they open or close. Give each fence its own line so Markdown
+/// parsers see the same blocks Slack shows.
+fn slack_code_blocks_to_markdown(input: &str) -> Cow<'_, str> {
+    let mut output = String::new();
+    let mut rest = input;
+    while let Some((before, opened)) = rest.split_once(SLACK_FENCE)
+        && let Some((code, after)) = opened.split_once(SLACK_FENCE)
+    {
+        output.push_str(before);
+        if !before.is_empty() && !before.ends_with('\n') {
+            output.push('\n');
+        }
+        let code = code.trim_prefix('\n').trim_suffix('\n');
+        output.extend([SLACK_FENCE, "\n", code, "\n", SLACK_FENCE, "\n"]);
+        rest = after.trim_prefix('\n');
+    }
+    if output.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    output.push_str(rest);
+    Cow::Owned(output)
 }
 
 pub fn copy_text(input: &str) -> Cow<'_, str> {
@@ -217,7 +247,7 @@ fn write_link(link: &SlackLink<'_>, format: LinkFormat, output: &mut String) {
     }
 }
 
-fn decode_slack_entities(input: &str) -> String {
+pub(crate) fn decode_slack_entities(input: &str) -> String {
     input
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -248,10 +278,20 @@ mod tests {
 
     #[test]
     fn code_and_non_web_slack_markup_remain_literal() {
-        let input = "`<https://example.com/|sample>`\n\n```text\n<https://example.com/|sample>\n```\n<@U123> <#C123|general>";
-        assert_eq!(render_text(input), input);
+        let input = "`<https://example.com/|sample>`\n\n```<https://example.com/|sample>```\n<@U123> <#C123|general>";
+        assert_eq!(
+            render_text(input),
+            "`<https://example.com/|sample>`\n\n```\n<https://example.com/|sample>\n```\n<@U123> <#C123|general>"
+        );
         assert_eq!(copy_text(input), input);
         assert_eq!(links(input), Vec::<reqwest::Url>::new());
+    }
+
+    #[test]
+    fn links_after_a_slack_code_block_are_found() {
+        let input = "```curl https://example.com/code\nok```\nsee https://example.com/after";
+        let urls: Vec<_> = links(input).into_iter().map(String::from).collect();
+        assert_eq!(urls, ["https://example.com/after"]);
     }
 
     #[test]

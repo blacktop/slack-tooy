@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::messages::{split_segments, split_to_width};
+use crate::message_links::decode_slack_entities;
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -98,7 +99,7 @@ impl Renderer {
             Event::Text(text) | Event::InlineMath(text) | Event::DisplayMath(text) => {
                 self.push_text(text.as_ref(), self.inline.style());
             }
-            Event::Code(code) => self.push_text(code.as_ref(), inline_code_style()),
+            Event::Code(code) => self.push_text(&decode_slack_entities(&code), inline_code_style()),
             Event::SoftBreak | Event::HardBreak => self.flush_segments(true),
             Event::Rule => {
                 self.flush_segments(false);
@@ -145,9 +146,12 @@ impl Renderer {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_segments(false);
-                let language = code_block_language(kind);
-                if let Some(ref lang) = language {
-                    self.lines.push(code_label_line(lang, self.width));
+                // Fences the Slack conversion leaves alone (an unclosed ``` or ~~~) can keep
+                // text beside them; show it as code instead of dropping it.
+                if let CodeBlockKind::Fenced(info) = kind
+                    && !info.is_empty()
+                {
+                    self.push_code_line(&info);
                 }
                 self.in_code_block = true;
             }
@@ -264,7 +268,7 @@ impl Renderer {
     }
 
     fn push_code_text(&mut self, text: &str) {
-        for line in text.lines() {
+        for line in decode_slack_entities(text).lines() {
             self.push_code_line(line);
         }
     }
@@ -300,24 +304,12 @@ impl Renderer {
     }
 }
 
-fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
-    match kind {
-        CodeBlockKind::Indented => None,
-        CodeBlockKind::Fenced(language) => language.split_whitespace().next().map(str::to_string),
-    }
-}
-
 fn inline_code_style() -> Style {
     Style::default().fg(theme::YELLOW).bg(theme::SURFACE_RAISED)
 }
 
 fn code_block_style() -> Style {
     Style::default().fg(theme::TEXT).bg(theme::SURFACE_RAISED)
-}
-
-fn code_label_line(language: &str, width: usize) -> Line<'static> {
-    let text = format!(" code {language} ");
-    Line::from(Span::styled(pad_to_width(&text, width), code_block_style()))
 }
 
 fn link_style() -> Style {
@@ -488,15 +480,57 @@ mod tests {
         );
     }
 
-    #[test]
-    fn renders_fenced_code_block_without_fence_markers() {
-        let lines = render_markdown("before\n```rust\nfn main() {}\n```\nafter", 20);
-        let rendered = lines.iter().map(text).collect::<Vec<_>>();
+    fn trimmed(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| text(line).trim_end().to_string())
+            .collect()
+    }
 
-        assert_eq!(rendered[0], "before");
-        assert_eq!(rendered[1], " code rust          ");
-        assert_eq!(rendered[2], " fn main() {}       ");
-        assert_eq!(rendered[3], "after");
+    #[test]
+    fn slack_code_block_keeps_opening_line_and_hides_inline_closing_fence() {
+        let input = "```iPhone:~ root# sw_vers\nProductName:iPhone OS\n80(admin)```\nyes";
+        let lines = render_markdown(input, 40);
+
+        assert_eq!(
+            trimmed(&lines),
+            [
+                " iPhone:~ root# sw_vers",
+                " ProductName:iPhone OS",
+                " 80(admin)",
+                "yes"
+            ]
+        );
+    }
+
+    #[test]
+    fn slack_code_block_inside_a_line_renders_as_a_block() {
+        let lines = render_markdown("before ```ls -la``` after", 20);
+
+        assert_eq!(trimmed(&lines), ["before", " ls -la", "after"]);
+    }
+
+    #[test]
+    fn fence_lines_with_own_newlines_add_no_blank_code_rows() {
+        let lines = render_markdown("before\n```\nfn main() {}\n```\nafter", 20);
+
+        assert_eq!(trimmed(&lines), ["before", " fn main() {}", "after"]);
+    }
+
+    #[test]
+    fn unclosed_fence_keeps_its_first_line() {
+        let lines = render_markdown("```foo bar\nbaz", 20);
+
+        assert_eq!(trimmed(&lines), [" foo bar", " baz"]);
+    }
+
+    #[test]
+    fn code_decodes_slack_entities() {
+        let block = render_markdown("```a &amp;&amp; b &gt; c &lt;d&gt;```", 40);
+        assert_eq!(trimmed(&block), [" a && b > c <d>"]);
+
+        let inline = render_markdown("run `x &lt; y &amp;&amp; z`", 40);
+        assert_eq!(trimmed(&inline), ["run x < y && z"]);
     }
 
     #[test]
@@ -539,11 +573,10 @@ mod tests {
 
     #[test]
     fn wraps_code_blocks_with_background_padding() {
-        let lines = render_markdown("```text\nabcdef\n```", 5);
+        let lines = render_markdown("```abcdef```", 5);
 
-        assert_eq!(text(&lines[0]), " code text ");
-        assert_eq!(text(&lines[1]), " abc ");
-        assert_eq!(text(&lines[2]), " def ");
-        assert!(lines[1].spans[0].style.bg.is_some());
+        assert_eq!(text(&lines[0]), " abc ");
+        assert_eq!(text(&lines[1]), " def ");
+        assert!(lines[0].spans[0].style.bg.is_some());
     }
 }
